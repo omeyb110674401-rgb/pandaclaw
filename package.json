@@ -29,6 +29,9 @@
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "bullmq": "^5.71.1",
+    "uuid": "^13.0.0"
+  }
 }
