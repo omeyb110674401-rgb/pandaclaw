@@ -178,7 +178,7 @@ const result = matcher.generateBindingRecommendation(
 | 协商结果 | 政协委员专业意见汇总 |
 | 表决结果 | 人大投票 + 理由记录 |
 | 最终决策 | 完整决策 + 后续步骤 |
-| **会议文件** | **官方格式文档（白皮书/红头文件/纪要）** |
+| **分层文档** | **L1 摘要/L2 过程/L3 决议/L4 档案** |
 
 ## 核心原则
 
@@ -202,7 +202,8 @@ pandaclaw/
 │   ├── project-expertise-matcher.js   # 项目身份匹配
 │   ├── meeting-state-store.js         # 状态持久化
 │   ├── meeting-message-template.js    # 消息模板（信息隔离）
-│   ├── meeting-document-template.js   # 文件模板（官方格式）
+│   ├── layered-document-generator.js  # 分层文档生成器
+│   ├── document-index.js              # 文档索引与检索
 │   ├── cppcc-interaction.js           # 政协交互环
 │   ├── npc-inquiry.js                 # 人大质询通道
 │   └── improved-meeting-flow.js       # 改进后的会议流程
