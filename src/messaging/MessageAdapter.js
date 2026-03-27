@@ -1,119 +1,110 @@
 /**
- * MessageAdapter - 消息适配器
+ * MessageAdapter - 消息适配器（符合契约 v1）
  * @author cppcc-2 (后端专家)
- * @version 1.0.0
+ * @version 2.0.0 - 契约合规版
+ * @contract contracts/messages.ts
  * 
  * 功能：
- * - 统一消息接口
  * - FastPath（进程内 <50ms）
  * - ReliablePath（BullMQ <200ms）
  * - 消息去重
- * - 版本路由
- * 
- * 验收标准：
- * - Fast Path 延迟 < 50ms
- * - Reliable Path 延迟 < 200ms
- * - 消息可靠性：零丢失、零重复
+ * - ACK确认机制
  */
 
 const EventEmitter = require('events');
 const { v4: uuidv4 } = require('uuid');
 
-// 延迟导入 BullMQ（可选依赖）
-let Queue, FlowProducer;
+/** 契约版本号 */
+const CONTRACT_VERSION = 1;
+
+// 从契约导入队列配置
+const QUEUE_CONFIG = {
+  QUEUES: {
+    SEND_QUEUE: 'pandaclaw:send',
+    RECEIVE_QUEUE: 'pandaclaw:receive',
+    DEAD_LETTER_QUEUE: 'pandaclaw:dead-letter',
+  },
+  REDIS: {
+    host: 'localhost',
+    port: 6379,
+    db: 0,
+  },
+  MESSAGE_TTL: 24 * 60 * 60 * 1000,
+  RETRY: {
+    maxRetries: 3,
+    backoff: {
+      type: 'exponential',
+      delay: 1000,
+    },
+  },
+};
+
+// 延迟导入 BullMQ
+let Queue, Worker;
 try {
   const bullmq = require('bullmq');
   Queue = bullmq.Queue;
-  FlowProducer = bullmq.FlowProducer;
+  Worker = bullmq.Worker;
 } catch (e) {
-  console.warn('⚠️ BullMQ 未安装，ReliablePath 将降级为 FastPath');
+  console.warn('⚠️ BullMQ 未安装，ReliablePath 将降级');
 }
 
 /**
- * 消息适配器类
+ * 消息适配器（符合 MessageAdapter 接口）
  */
 class MessageAdapter extends EventEmitter {
-  /**
-   * 创建消息适配器
-   * @param {Object} options 配置选项
-   */
   constructor(options = {}) {
     super();
     
-    this.options = {
-      fastPathEnabled: true,
-      reliablePathEnabled: !!Queue,
-      redisHost: options.redisHost || 'localhost',
-      redisPort: options.redisPort || 6379,
-      dedupTTL: options.dedupTTL || 60000, // 去重缓存 TTL
-      ...options
+    this.config = {
+      ...QUEUE_CONFIG,
+      ...options,
+      redis: { ...QUEUE_CONFIG.REDIS, ...options.redis }
     };
     
-    // 消息通道
     this.fastPath = null;
     this.reliablePath = null;
-    
-    // 去重缓存
     this.dedupCache = new Map();
-    
-    // 消息处理器映射
     this.handlers = new Map();
+    this.pendingAcks = new Map();
     
-    // 统计信息
     this.stats = {
       fastPathCount: 0,
       reliablePathCount: 0,
       dedupCount: 0,
-      errorCount: 0
+      ackCount: 0,
+      errorCount: 0,
+      messagesProcessed: 0,
+      totalLatency: 0
     };
     
-    // 初始化
     this._initialize();
   }
   
-  /**
-   * 初始化消息通道
-   */
   _initialize() {
-    // 初始化 FastPath（EventEmitter）
+    // FastPath (EventEmitter)
     this.fastPath = new FastPathChannel();
     this._setupFastPathHandlers();
     
-    // 初始化 ReliablePath（BullMQ）
-    if (this.options.reliablePathEnabled && Queue) {
+    // ReliablePath (BullMQ)
+    if (Queue && this.config.enableReliable !== false) {
       this._initializeReliablePath();
     }
     
-    console.log('✅ MessageAdapter 初始化完成');
+    console.log('✅ MessageAdapter 初始化完成 (契约 v1)');
     console.log(`   FastPath: 已启用`);
-    console.log(`   ReliablePath: ${this.options.reliablePathEnabled ? '已启用' : '未启用（降级模式）'}`);
+    console.log(`   ReliablePath: ${this.reliablePath ? '已启用' : '降级模式'}`);
   }
   
-  /**
-   * 设置 FastPath 事件处理器
-   */
   _setupFastPathHandlers() {
     this.fastPath.on('message', (message) => {
       this._handleMessage('fast', message);
     });
-    
-    this.fastPath.on('error', (error) => {
-      this.stats.errorCount++;
-      this.emit('error', { type: 'fast', error });
-    });
   }
   
-  /**
-   * 初始化 ReliablePath
-   */
   _initializeReliablePath() {
     try {
-      const connection = {
-        host: this.options.redisHost,
-        port: this.options.redisPort
-      };
-      
-      this.reliablePath = new ReliablePathChannel(connection);
+      this.reliablePath = new ReliablePathChannel(this.config);
       
       this.reliablePath.on('message', (message) => {
         this._handleMessage('reliable', message);
@@ -124,51 +115,69 @@ class MessageAdapter extends EventEmitter {
         this.emit('error', { type: 'reliable', error });
       });
     } catch (e) {
-      console.warn('⚠️ ReliablePath 初始化失败，降级为 FastPath');
-      this.options.reliablePathEnabled = false;
+      console.warn('⚠️ ReliablePath 初始化失败:', e.message);
+      this.reliablePath = null;
     }
   }
   
-  // ==================== 消息发送 ====================
+  // ==================== MessageAdapter 接口实现 ====================
   
   /**
-   * 发送消息
-   * @param {Object} message 消息对象
-   * @param {Object} options 发送选项
+   * 发送消息（符合 MessageAdapter.send）
+   * @param {QueuedMessage} message 消息对象
+   * @returns {Promise<string>} 消息ID
    */
-  async send(message, options = {}) {
-    // 生成消息 ID
-    const messageId = message.messageId || uuidv4();
+  async send(message) {
+    const messageId = message.id || uuidv4();
+    const correlationId = message.correlationId || uuidv4();
+    const now = Date.now();
+    
     const enrichedMessage = {
-      ...message,
-      messageId,
-      timestamp: message.timestamp || Date.now()
+      id: messageId,
+      version: CONTRACT_VERSION,
+      correlationId,
+      meetingId: message.meetingId,
+      from: message.from,
+      to: message.to,
+      type: message.type,
+      priority: message.priority || 'normal',
+      payload: message.payload,
+      metadata: {
+        step: message.metadata?.step || 0,
+        requiresResponse: message.metadata?.requiresResponse || false,
+        timeout: message.metadata?.timeout || 60000,
+        retryCount: message.metadata?.retryCount || 0
+      },
+      createdAt: now,
+      expiresAt: now + this.config.MESSAGE_TTL
     };
     
     // 去重检查
     if (this._isDuplicate(messageId)) {
       this.stats.dedupCount++;
-      return { messageId, status: 'duplicate', message: '消息已处理' };
+      return messageId;
     }
     
-    // 选择发送通道
-    const channel = this._selectChannel(options);
+    this._recordMessage(messageId);
+    
+    const channel = this._selectChannel(message.priority);
+    const startTime = Date.now();
     
     try {
-      // 记录消息发送
-      this._recordMessage(messageId);
-      
-      // 发送消息
-      const result = await channel.send(enrichedMessage);
+      await channel.send(enrichedMessage);
       
       // 更新统计
+      const latency = Date.now() - startTime;
+      this.stats.totalLatency += latency;
+      this.stats.messagesProcessed++;
+      
       if (channel === this.fastPath) {
         this.stats.fastPathCount++;
       } else {
         this.stats.reliablePathCount++;
       }
       
-      return { messageId, status: 'sent', channel: channel.name };
+      return messageId;
     } catch (error) {
       this.stats.errorCount++;
       this.emit('error', { type: 'send', message: enrichedMessage, error });
@@ -177,290 +186,233 @@ class MessageAdapter extends EventEmitter {
   }
   
   /**
-   * 发送到指定 Agent
-   * @param {string} agentId Agent ID
-   * @param {Object} content 消息内容
-   * @param {Object} options 发送选项
+   * 广播消息（符合 MessageAdapter.broadcast）
+   * @param {string} meetingId 会议ID
+   * @param {Omit<QueuedMessage, 'to'>} message 消息对象
+   * @returns {Promise<string>} 消息ID
    */
-  async sendToAgent(agentId, content, options = {}) {
+  async broadcast(meetingId, message) {
     return this.send({
-      type: 'agent_message',
-      receiver: agentId,
-      content,
-      meetingId: options.meetingId
-    }, options);
-  }
-  
-  /**
-   * 广播消息
-   * @param {string[]} agentIds Agent ID 列表
-   * @param {Object} content 消息内容
-   * @param {Object} options 发送选项
-   */
-  async broadcast(agentIds, content, options = {}) {
-    const results = [];
-    
-    for (const agentId of agentIds) {
-      const result = await this.sendToAgent(agentId, content, options);
-      results.push({ agentId, ...result });
-    }
-    
-    return results;
-  }
-  
-  /**
-   * 发送并等待响应
-   * @param {Object} message 消息对象
-   * @param {number} timeout 超时时间（毫秒）
-   */
-  async sendAndWait(message, timeout = 30000) {
-    const messageId = message.messageId || uuidv4();
-    
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.handlers.delete(messageId);
-        reject(new Error(`消息响应超时: ${messageId}`));
-      }, timeout);
-      
-      // 注册响应处理器
-      this.handlers.set(messageId, (response) => {
-        clearTimeout(timer);
-        resolve(response);
-      });
-      
-      this.send({ ...message, messageId });
+      ...message,
+      meetingId,
+      to: 'all'
     });
   }
   
-  // ==================== 消息接收 ====================
+  /**
+   * 等待响应（符合 MessageAdapter.waitForResponse）
+   * @param {string} correlationId 关联ID
+   * @param {number} timeout 超时时间（毫秒）
+   * @returns {Promise<ResponseMessage>} 响应消息
+   */
+  async waitForResponse(correlationId, timeout = 30000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.handlers.delete(correlationId);
+        reject(new Error(`响应超时: ${correlationId}`));
+      }, timeout);
+      
+      this.handlers.set(correlationId, (response) => {
+        clearTimeout(timer);
+        resolve(response);
+      });
+    });
+  }
   
   /**
-   * 处理接收到的消息
+   * 订阅消息（符合 MessageAdapter.subscribe）
+   * @param {string} agentId Agent ID
+   * @param {Function} handler 处理函数
    */
+  subscribe(agentId, handler) {
+    const wrapper = async (message) => {
+      if (message.to === agentId || message.to === 'all') {
+        await handler(message);
+      }
+    };
+    
+    this.on('message', wrapper);
+    return () => this.off('message', wrapper);
+  }
+  
+  /**
+   * 确认消息（符合 MessageAdapter.ack）
+   * @param {string} messageId 消息ID
+   */
+  async ack(messageId) {
+    this.stats.ackCount++;
+    this.pendingAcks.delete(messageId);
+    
+    // 如果使用 ReliablePath，确认消息
+    if (this.reliablePath && this.reliablePath.ack) {
+      await this.reliablePath.ack(messageId);
+    }
+  }
+  
+  // ==================== 内部方法 ====================
+  
   _handleMessage(channelType, message) {
-    // 去重检查
-    if (this._isDuplicate(message.messageId)) {
+    if (this._isDuplicate(message.id)) {
       this.stats.dedupCount++;
       return;
     }
     
-    // 记录消息
-    this._recordMessage(message.messageId);
+    this._recordMessage(message.id);
+    this.pendingAcks.set(message.id, message);
     
     // 检查是否有等待的处理器
-    const handler = this.handlers.get(message.messageId);
+    const handler = this.handlers.get(message.correlationId);
     if (handler) {
-      handler(message);
-      this.handlers.delete(message.messageId);
+      const response = {
+        id: uuidv4(),
+        correlationId: message.correlationId,
+        status: 'success',
+        payload: message.payload,
+        from: message.from,
+        respondedAt: Date.now()
+      };
+      handler(response);
+      this.handlers.delete(message.correlationId);
       return;
     }
     
-    // 触发事件
     this.emit('message', { channel: channelType, message });
   }
   
-  /**
-   * 订阅消息
-   * @param {string} pattern 消息模式
-   * @param {Function} handler 处理函数
-   */
-  subscribe(pattern, handler) {
-    this.on('message', ({ channel, message }) => {
-      if (this._matchPattern(message, pattern)) {
-        handler(message);
-      }
-    });
-  }
-  
-  // ==================== 工具方法 ====================
-  
-  /**
-   * 选择发送通道
-   */
-  _selectChannel(options) {
-    // 强制使用 ReliablePath
-    if (options.reliable && this.reliablePath) {
+  _selectChannel(priority) {
+    if (priority === 'high' && this.reliablePath) {
       return this.reliablePath;
     }
-    
-    // 默认使用 FastPath
     return this.fastPath;
   }
   
-  /**
-   * 检查消息是否重复
-   */
   _isDuplicate(messageId) {
     return this.dedupCache.has(messageId);
   }
   
-  /**
-   * 记录消息
-   */
   _recordMessage(messageId) {
     this.dedupCache.set(messageId, Date.now());
     
     // 清理过期缓存
-    this._cleanupDedupCache();
-  }
-  
-  /**
-   * 清理过期的去重缓存
-   */
-  _cleanupDedupCache() {
     const now = Date.now();
-    const ttl = this.options.dedupTTL;
-    
     for (const [id, timestamp] of this.dedupCache.entries()) {
-      if (now - timestamp > ttl) {
+      if (now - timestamp > 60000) {
         this.dedupCache.delete(id);
       }
     }
   }
   
   /**
-   * 匹配消息模式
-   */
-  _matchPattern(message, pattern) {
-    if (typeof pattern === 'string') {
-      return message.type === pattern;
-    }
-    if (pattern instanceof RegExp) {
-      return pattern.test(message.type);
-    }
-    if (typeof pattern === 'function') {
-      return pattern(message);
-    }
-    return true;
-  }
-  
-  /**
-   * 获取统计信息
+   * 获取统计信息（符合 HealthCheckResponse.metrics）
    */
   getStats() {
+    const avgLatency = this.stats.messagesProcessed > 0
+      ? Math.round(this.stats.totalLatency / this.stats.messagesProcessed)
+      : 0;
+    
     return {
-      ...this.stats,
-      dedupCacheSize: this.dedupCache.size,
-      pendingHandlers: this.handlers.size
+      messagesProcessed: this.stats.messagesProcessed,
+      averageLatency: avgLatency,
+      errorRate: this.stats.messagesProcessed > 0
+        ? Math.round((this.stats.errorCount / this.stats.messagesProcessed) * 100)
+        : 0,
+      // 额外统计
+      fastPathCount: this.stats.fastPathCount,
+      reliablePathCount: this.stats.reliablePathCount,
+      dedupCount: this.stats.dedupCount,
+      ackCount: this.stats.ackCount
     };
   }
   
-  /**
-   * 关闭连接
-   */
   async close() {
-    if (this.fastPath) {
-      await this.fastPath.close();
-    }
-    if (this.reliablePath) {
-      await this.reliablePath.close();
-    }
+    if (this.fastPath) await this.fastPath.close();
+    if (this.reliablePath) await this.reliablePath.close();
     this.dedupCache.clear();
     this.handlers.clear();
+    this.pendingAcks.clear();
   }
 }
 
 /**
- * FastPath 通道（EventEmitter 实现）
+ * FastPath 通道（进程内）
  */
 class FastPathChannel extends EventEmitter {
   constructor() {
     super();
     this.name = 'fast';
-    this.isRunning = true;
   }
   
   async send(message) {
-    if (!this.isRunning) {
-      throw new Error('FastPath 通道已关闭');
-    }
-    
-    // 模拟异步发送（实际是同步）
-    setImmediate(() => {
-      this.emit('message', message);
-    });
-    
-    return { delivered: true, timestamp: Date.now() };
+    setImmediate(() => this.emit('message', message));
+    return { delivered: true };
   }
   
   async close() {
-    this.isRunning = false;
     this.removeAllListeners();
   }
 }
 
 /**
- * ReliablePath 通道（BullMQ 实现）
+ * ReliablePath 通道（BullMQ）
  */
 class ReliablePathChannel extends EventEmitter {
-  constructor(connection) {
+  constructor(config) {
     super();
     this.name = 'reliable';
-    this.connection = connection;
+    this.config = config;
     this.queue = null;
     this.worker = null;
-    this.isRunning = false;
     
-    this._initialize();
+    if (Queue) {
+      this._initialize();
+    }
   }
   
   _initialize() {
-    if (!Queue) {
-      throw new Error('BullMQ 未安装');
-    }
-    
-    // 创建队列
-    this.queue = new Queue('pandaclaw-messages', { connection: this.connection });
-    
-    // 创建消费者
-    this._startWorker();
-    
-    this.isRunning = true;
-  }
-  
-  async _startWorker() {
-    const { Worker } = require('bullmq');
-    
-    this.worker = new Worker(
-      'pandaclaw-messages',
-      async (job) => {
-        this.emit('message', job.data);
-        return { processed: true };
-      },
-      { connection: this.connection }
-    );
-    
-    this.worker.on('error', (error) => {
-      this.emit('error', error);
+    this.queue = new Queue(QUEUE_CONFIG.QUEUES.SEND_QUEUE, {
+      connection: this.config.redis
     });
+    
+    if (Worker) {
+      this.worker = new Worker(
+        QUEUE_CONFIG.QUEUES.RECEIVE_QUEUE,
+        async (job) => {
+          this.emit('message', job.data);
+          return { processed: true };
+        },
+        { connection: this.config.redis }
+      );
+    }
   }
   
   async send(message) {
-    if (!this.isRunning) {
-      throw new Error('ReliablePath 通道已关闭');
+    if (!this.queue) {
+      throw new Error('ReliablePath 未初始化');
     }
     
     const job = await this.queue.add('message', message, {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 1000
-      }
+      attempts: QUEUE_CONFIG.RETRY.maxRetries,
+      backoff: QUEUE_CONFIG.RETRY.backoff
     });
     
-    return { jobId: job.id, delivered: true, timestamp: Date.now() };
+    return { jobId: job.id, delivered: true };
+  }
+  
+  async ack(messageId) {
+    // BullMQ 自动确认
   }
   
   async close() {
-    this.isRunning = false;
-    if (this.worker) {
-      await this.worker.close();
-    }
-    if (this.queue) {
-      await this.queue.close();
-    }
+    if (this.worker) await this.worker.close();
+    if (this.queue) await this.queue.close();
     this.removeAllListeners();
   }
 }
 
-module.exports = { MessageAdapter, FastPathChannel, ReliablePathChannel };
+module.exports = {
+  MessageAdapter,
+  FastPathChannel,
+  ReliablePathChannel,
+  QUEUE_CONFIG,
+  CONTRACT_VERSION
+};

@@ -1,213 +1,174 @@
 /**
- * StateManager - 状态管理器（带 WAL 支持）
+ * StateManager - 状态管理器（符合契约 v1）
  * @author cppcc-2 (后端专家)
- * @version 1.0.0
+ * @version 2.0.0 - 契约合规版
+ * @contract contracts/api.ts
  * 
  * 功能：
  * - SQLite 持久化存储
  * - WAL 写前日志
- * - 原子写入保证
- * - 快速状态恢复
- * 
- * 验收标准：
- * - 状态恢复 < 30s
- * - 零数据丢失
+ * - StateSnapshot checksum验证
+ * - 时间戳使用毫秒格式
  */
 
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
+/** 契约版本号 */
+const CONTRACT_VERSION = 1;
+
 class StateManager {
-  /**
-   * 创建状态管理器
-   * @param {Object} options 配置选项
-   * @param {string} options.dbPath 数据库路径
-   * @param {boolean} options.walEnabled 启用 WAL 模式
-   */
   constructor(options = {}) {
     this.dbPath = options.dbPath || path.join(process.cwd(), 'data', 'pandaclaw.db');
     this.walEnabled = options.walEnabled !== false;
     this.db = null;
     this.isInitialized = false;
-    
-    // 写入队列（确保顺序写入）
-    this.writeQueue = [];
-    this.isWriting = false;
-    
-    // 缓存层
     this.cache = new Map();
-    this.cacheTTL = 30000; // 30秒缓存
+    this.cacheTTL = 30000;
   }
   
-  /**
-   * 初始化数据库
-   */
   initialize() {
-    // 确保目录存在
     const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
     
-    // 创建数据库连接
     this.db = new Database(this.dbPath);
     
-    // 启用 WAL 模式
     if (this.walEnabled) {
       this.db.pragma('journal_mode = WAL');
       this.db.pragma('synchronous = NORMAL');
-      this.db.pragma('wal_autocheckpoint = 1000');
     }
     
-    // 创建表结构
     this._createTables();
-    
     this.isInitialized = true;
-    console.log('✅ StateManager 初始化完成');
-    console.log(`   数据库路径: ${this.dbPath}`);
-    console.log(`   WAL 模式: ${this.walEnabled ? '已启用' : '未启用'}`);
     
+    console.log('✅ StateManager 初始化完成 (契约 v1)');
     return this;
   }
   
-  /**
-   * 创建数据库表
-   */
   _createTables() {
-    // 会议状态表
+    // 会议表（符合 Meeting 接口）
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS meetings (
         id TEXT PRIMARY KEY,
-        meeting_type TEXT NOT NULL,
+        version INTEGER DEFAULT ${CONTRACT_VERSION},
         topic TEXT NOT NULL,
-        description TEXT,
+        type TEXT NOT NULL,
         status TEXT DEFAULT 'pending',
-        current_stage TEXT,
-        current_stage_index INTEGER DEFAULT -1,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
         participants TEXT,
-        expertise_bindings TEXT,
-        stage_results TEXT,
-        opinions TEXT,
-        votes TEXT,
-        inquiries TEXT,
-        inquiry_responses TEXT,
-        final_decision TEXT,
-        created_at TEXT,
-        updated_at TEXT,
-        completed_at TEXT
+        context TEXT,
+        decisions TEXT
       )
     `);
     
-    // 消息日志表（用于恢复和审计）
+    // 状态快照表（符合 StateSnapshot 接口）
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS message_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+      CREATE TABLE IF NOT EXISTS state_snapshots (
+        id TEXT PRIMARY KEY,
         meeting_id TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        direction TEXT NOT NULL,
-        sender TEXT,
-        receiver TEXT,
-        content TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        delivered_at TEXT,
+        step INTEGER NOT NULL,
+        data TEXT,
+        checksum TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
         FOREIGN KEY (meeting_id) REFERENCES meetings(id)
       )
     `);
     
-    // 操作日志表（WAL）
+    // 检查点表（符合 Checkpoint 接口）
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS operation_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+      CREATE TABLE IF NOT EXISTS checkpoints (
+        id TEXT PRIMARY KEY,
         meeting_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        data TEXT,
-        version INTEGER DEFAULT 1,
-        created_at TEXT,
-        UNIQUE(meeting_id, version)
+        snapshot_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (meeting_id) REFERENCES meetings(id),
+        FOREIGN KEY (snapshot_id) REFERENCES state_snapshots(id)
       )
     `);
     
-    // Agent 状态表
+    // Agent状态表（符合 AgentStatus 接口）
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS agent_states (
-        agent_id TEXT PRIMARY KEY,
-        session_key TEXT,
-        expertise_id TEXT,
-        expertise_name TEXT,
+      CREATE TABLE IF NOT EXISTS agent_status (
+        id TEXT PRIMARY KEY,
+        expertise TEXT,
         status TEXT DEFAULT 'idle',
-        current_meeting_id TEXT,
-        last_heartbeat TEXT,
-        created_at TEXT,
-        updated_at TEXT
+        last_heartbeat INTEGER,
+        current_task TEXT
       )
     `);
     
     // 创建索引
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);
-      CREATE INDEX IF NOT EXISTS idx_message_log_meeting ON message_log(meeting_id);
-      CREATE INDEX IF NOT EXISTS idx_operation_log_meeting ON operation_log(meeting_id);
+      CREATE INDEX IF NOT EXISTS idx_snapshots_meeting ON state_snapshots(meeting_id);
     `);
   }
   
-  // ==================== 会议状态管理 ====================
+  // ==================== 会议管理（符合 Meeting 接口）====================
   
   /**
    * 创建会议
-   * @param {Object} meetingData 会议数据
+   * @param {Object} data 会议数据
+   * @returns {Meeting} 符合契约的会议对象
    */
-  createMeeting(meetingData) {
-    const id = meetingData.id || uuidv4();
-    const now = new Date().toISOString();
+  createMeeting(data) {
+    const id = data.id || uuidv4();
+    const now = Date.now(); // 毫秒时间戳
+    
+    const meeting = {
+      id,
+      version: CONTRACT_VERSION,
+      topic: data.topic,
+      type: data.type || 'proposal-review',
+      status: 'pending',
+      createdAt: now,
+      updatedAt: now,
+      participants: data.participants || { cppcc: [], npc: [] },
+      context: data.context || {
+        background: '',
+        history: [],
+        constraints: [],
+        successCriteria: []
+      },
+      decisions: []
+    };
     
     const stmt = this.db.prepare(`
-      INSERT INTO meetings (
-        id, meeting_type, topic, description, status, 
-        current_stage, current_stage_index, participants, expertise_bindings,
-        stage_results, opinions, votes, inquiries, inquiry_responses,
-        created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO meetings (id, version, topic, type, status, created_at, updated_at, participants, context, decisions)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     
     stmt.run(
-      id,
-      meetingData.meetingType || 'CONSULTATION',
-      meetingData.topic,
-      meetingData.description || '',
-      'pending',
-      null,
-      -1,
-      JSON.stringify(meetingData.participants || { cppcc: [], npc: [] }),
-      JSON.stringify(meetingData.expertiseBindings || {}),
-      JSON.stringify({}),
-      JSON.stringify({}),
-      JSON.stringify({}),
-      JSON.stringify({}),
-      JSON.stringify({}),
-      now,
-      now
+      meeting.id,
+      meeting.version,
+      meeting.topic,
+      meeting.type,
+      meeting.status,
+      meeting.createdAt,
+      meeting.updatedAt,
+      JSON.stringify(meeting.participants),
+      JSON.stringify(meeting.context),
+      JSON.stringify(meeting.decisions)
     );
     
-    // 记录操作日志
-    this._logOperation(id, 'CREATE_MEETING', meetingData);
-    
-    // 更新缓存
-    this.cache.set(id, { ...meetingData, id, status: 'pending', createdAt: now });
-    
-    return this.getMeeting(id);
+    this.cache.set(id, meeting);
+    return meeting;
   }
   
   /**
    * 获取会议
    * @param {string} meetingId 会议ID
+   * @returns {Meeting|null} 符合契约的会议对象
    */
   getMeeting(meetingId) {
-    // 先查缓存
     const cached = this.cache.get(meetingId);
-    if (cached && Date.now() - new Date(cached.updatedAt).getTime() < this.cacheTTL) {
+    if (cached && Date.now() - cached.updatedAt < this.cacheTTL) {
       return cached;
     }
     
@@ -218,325 +179,230 @@ class StateManager {
     
     const meeting = this._rowToMeeting(row);
     this.cache.set(meetingId, meeting);
+    return meeting;
+  }
+  
+  /**
+   * 更新会议状态（符合 MeetingStatus）
+   * @param {string} meetingId 会议ID
+   * @param {MeetingStatus} status 新状态
+   */
+  updateMeetingStatus(meetingId, status) {
+    const validStatuses = [
+      'pending', 'step1-alignment', 'step2-information', 'step3-roles',
+      'step4-coordination', 'step5-deliberation', 'step6-voting',
+      'step7-decision', 'completed', 'cancelled'
+    ];
+    
+    if (!validStatuses.includes(status)) {
+      throw new Error(`无效状态: ${status}`);
+    }
+    
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      UPDATE meetings SET status = ?, updated_at = ? WHERE id = ?
+    `);
+    
+    stmt.run(status, now, meetingId);
+    
+    const meeting = this.getMeeting(meetingId);
+    if (meeting) {
+      meeting.status = status;
+      meeting.updatedAt = now;
+      this.cache.set(meetingId, meeting);
+    }
     
     return meeting;
   }
   
   /**
-   * 更新会议状态
+   * 记录决策（符合 Decision 接口）
    * @param {string} meetingId 会议ID
-   * @param {Object} updates 更新内容
+   * @param {Decision} decision 决策对象
    */
-  updateMeeting(meetingId, updates) {
+  recordDecision(meetingId, decision) {
     const meeting = this.getMeeting(meetingId);
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
-    }
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    const now = new Date().toISOString();
-    const fields = [];
-    const values = [];
+    const decisionRecord = {
+      id: decision.id || uuidv4(),
+      content: decision.content,
+      rationale: decision.rationale,
+      timestamp: Date.now(),
+      votes: decision.votes || []
+    };
     
-    // 构建更新字段
-    for (const [key, value] of Object.entries(updates)) {
-      if (this._isJsonField(key)) {
-        fields.push(`${this._camelToSnake(key)} = ?`);
-        values.push(JSON.stringify(value));
-      } else if (['status', 'currentStage', 'currentStageIndex', 'finalDecision', 'completedAt'].includes(key)) {
-        fields.push(`${this._camelToSnake(key)} = ?`);
-        values.push(value);
-      }
-    }
-    
-    if (fields.length === 0) return meeting;
-    
-    fields.push('updated_at = ?');
-    values.push(now);
-    values.push(meetingId);
+    meeting.decisions.push(decisionRecord);
+    meeting.updatedAt = Date.now();
     
     const stmt = this.db.prepare(`
-      UPDATE meetings SET ${fields.join(', ')} WHERE id = ?
+      UPDATE meetings SET decisions = ?, updated_at = ? WHERE id = ?
     `);
     
-    stmt.run(...values);
+    stmt.run(JSON.stringify(meeting.decisions), meeting.updatedAt, meetingId);
+    this.cache.set(meetingId, meeting);
     
-    // 记录操作日志
-    this._logOperation(meetingId, 'UPDATE_MEETING', updates);
-    
-    // 更新缓存
-    const updated = { ...meeting, ...updates, updatedAt: now };
-    this.cache.set(meetingId, updated);
-    
-    return updated;
+    return decisionRecord;
   }
   
-  /**
-   * 列出会议
-   * @param {Object} filters 过滤条件
-   */
-  listMeetings(filters = {}) {
-    let sql = 'SELECT * FROM meetings WHERE 1=1';
-    const params = [];
-    
-    if (filters.status) {
-      sql += ' AND status = ?';
-      params.push(filters.status);
-    }
-    
-    if (filters.meetingType) {
-      sql += ' AND meeting_type = ?';
-      params.push(filters.meetingType);
-    }
-    
-    sql += ' ORDER BY created_at DESC';
-    
-    if (filters.limit) {
-      sql += ' LIMIT ?';
-      params.push(filters.limit);
-    }
-    
-    const stmt = this.db.prepare(sql);
-    const rows = stmt.all(...params);
-    
-    return rows.map(row => this._rowToMeeting(row));
-  }
-  
-  // ==================== 消息日志 ====================
+  // ==================== 状态快照（符合 StateSnapshot 接口）====================
   
   /**
-   * 记录消息
-   * @param {Object} message 消息对象
-   */
-  logMessage(message) {
-    const messageId = message.messageId || uuidv4();
-    
-    const stmt = this.db.prepare(`
-      INSERT INTO message_log (
-        meeting_id, message_id, direction, sender, receiver, content, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-    
-    stmt.run(
-      message.meetingId,
-      messageId,
-      message.direction,
-      message.sender,
-      message.receiver,
-      JSON.stringify(message.content),
-      'pending',
-      new Date().toISOString()
-    );
-    
-    return messageId;
-  }
-  
-  /**
-   * 更新消息状态
-   * @param {string} messageId 消息ID
-   * @param {string} status 新状态
-   */
-  updateMessageStatus(messageId, status) {
-    const stmt = this.db.prepare(`
-      UPDATE message_log SET status = ?, delivered_at = ? WHERE message_id = ?
-    `);
-    
-    stmt.run(status, status === 'delivered' ? new Date().toISOString() : null, messageId);
-  }
-  
-  /**
-   * 获取会议消息历史
+   * 创建状态快照
    * @param {string} meetingId 会议ID
+   * @param {number} step 步骤号
+   * @param {Object} data 快照数据
+   * @returns {StateSnapshot} 符合契约的快照对象
    */
-  getMessageHistory(meetingId) {
-    const stmt = this.db.prepare(`
-      SELECT * FROM message_log WHERE meeting_id = ? ORDER BY created_at ASC
-    `);
+  createSnapshot(meetingId, step, data) {
+    const id = uuidv4();
+    const timestamp = Date.now();
+    const checksum = this._computeChecksum({ meetingId, step, data, timestamp });
     
-    return stmt.all(meetingId).map(row => ({
-      ...row,
-      content: JSON.parse(row.content || '{}')
-    }));
-  }
-  
-  // ==================== Agent 状态管理 ====================
-  
-  /**
-   * 注册 Agent
-   * @param {string} agentId Agent ID
-   * @param {Object} data Agent 数据
-   */
-  registerAgent(agentId, data = {}) {
-    const now = new Date().toISOString();
+    const snapshot = {
+      id,
+      meetingId,
+      step,
+      data,
+      checksum,
+      timestamp
+    };
     
     const stmt = this.db.prepare(`
-      INSERT OR REPLACE INTO agent_states (
-        agent_id, session_key, expertise_id, expertise_name, status, 
-        current_meeting_id, last_heartbeat, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO state_snapshots (id, meeting_id, step, data, checksum, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)
     `);
     
-    stmt.run(
-      agentId,
-      data.sessionKey || `agent:${agentId}:main`,
-      data.expertiseId || null,
-      data.expertiseName || null,
-      data.status || 'idle',
-      data.currentMeetingId || null,
-      now,
-      now,
-      now
-    );
+    stmt.run(id, meetingId, step, JSON.stringify(data), checksum, timestamp);
     
-    return this.getAgent(agentId);
+    return snapshot;
   }
   
   /**
-   * 获取 Agent 状态
-   * @param {string} agentId Agent ID
+   * 获取最新快照
+   * @param {string} meetingId 会议ID
+   * @returns {StateSnapshot|null} 符合契约的快照对象
    */
-  getAgent(agentId) {
-    const stmt = this.db.prepare('SELECT * FROM agent_states WHERE agent_id = ?');
-    const row = stmt.get(agentId);
+  getLatestSnapshot(meetingId) {
+    const stmt = this.db.prepare(`
+      SELECT * FROM state_snapshots WHERE meeting_id = ? ORDER BY timestamp DESC LIMIT 1
+    `);
     
+    const row = stmt.get(meetingId);
     if (!row) return null;
     
     return {
-      agentId: row.agent_id,
-      sessionKey: row.session_key,
-      expertiseId: row.expertise_id,
-      expertiseName: row.expertise_name,
-      status: row.status,
-      currentMeetingId: row.current_meeting_id,
-      lastHeartbeat: row.last_heartbeat,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at
+      id: row.id,
+      meetingId: row.meeting_id,
+      step: row.step,
+      data: JSON.parse(row.data || '{}'),
+      checksum: row.checksum,
+      timestamp: row.timestamp
     };
   }
   
   /**
-   * 更新 Agent 心跳
-   * @param {string} agentId Agent ID
+   * 验证快照checksum
+   * @param {StateSnapshot} snapshot 快照对象
+   * @returns {boolean} 是否有效
    */
-  heartbeat(agentId) {
-    const stmt = this.db.prepare(`
-      UPDATE agent_states SET last_heartbeat = ?, updated_at = ? WHERE agent_id = ?
-    `);
-    
-    const now = new Date().toISOString();
-    stmt.run(now, now, agentId);
-    
-    return this.getAgent(agentId);
+  verifySnapshot(snapshot) {
+    const computed = this._computeChecksum({
+      meetingId: snapshot.meetingId,
+      step: snapshot.step,
+      data: snapshot.data,
+      timestamp: snapshot.timestamp
+    });
+    return computed === snapshot.checksum;
   }
   
-  // ==================== 操作日志（WAL）====================
+  // ==================== Agent状态（符合 AgentStatus 接口）====================
   
   /**
-   * 记录操作日志
+   * 更新Agent心跳
+   * @param {HeartbeatRequest} request 心跳请求
+   * @returns {AgentStatus} Agent状态
    */
-  _logOperation(meetingId, operation, data) {
-    // 获取当前版本
-    const versionStmt = this.db.prepare(`
-      SELECT COALESCE(MAX(version), 0) + 1 as next_version FROM operation_log WHERE meeting_id = ?
-    `);
-    const { next_version } = versionStmt.get(meetingId);
+  heartbeat(request) {
+    const now = Date.now();
     
     const stmt = this.db.prepare(`
-      INSERT INTO operation_log (meeting_id, operation, data, version, created_at)
+      INSERT OR REPLACE INTO agent_status (id, expertise, status, last_heartbeat, current_task)
       VALUES (?, ?, ?, ?, ?)
     `);
     
-    stmt.run(meetingId, operation, JSON.stringify(data), next_version, new Date().toISOString());
+    stmt.run(request.agentId, request.expertise || '', request.status, now, request.currentTask || null);
+    
+    return {
+      id: request.agentId,
+      expertise: request.expertise || '',
+      status: request.status,
+      lastHeartbeat: now,
+      currentTask: request.currentTask
+    };
   }
   
   /**
-   * 获取操作日志
-   * @param {string} meetingId 会议ID
-   * @param {number} fromVersion 起始版本
+   * 获取活跃Agent列表
+   * @param {number} threshold 阈值（毫秒）
+   * @returns {AgentStatus[]} Agent状态列表
    */
-  getOperationLog(meetingId, fromVersion = 0) {
+  getActiveAgents(threshold = 120000) {
+    const now = Date.now();
     const stmt = this.db.prepare(`
-      SELECT * FROM operation_log 
-      WHERE meeting_id = ? AND version > ?
-      ORDER BY version ASC
+      SELECT * FROM agent_status WHERE last_heartbeat > ?
     `);
     
-    return stmt.all(meetingId, fromVersion).map(row => ({
-      ...row,
-      data: JSON.parse(row.data || '{}')
+    return stmt.all(now - threshold).map(row => ({
+      id: row.id,
+      expertise: row.expertise,
+      status: row.status,
+      lastHeartbeat: row.last_heartbeat,
+      currentTask: row.current_task
     }));
   }
   
   // ==================== 工具方法 ====================
   
-  /**
-   * 数据库行转会议对象
-   */
   _rowToMeeting(row) {
     return {
       id: row.id,
-      meetingType: row.meeting_type,
+      version: row.version,
       topic: row.topic,
-      description: row.description,
+      type: row.type,
       status: row.status,
-      currentStage: row.current_stage,
-      currentStageIndex: row.current_stage_index,
-      participants: JSON.parse(row.participants || '{}'),
-      expertiseBindings: JSON.parse(row.expertise_bindings || '{}'),
-      stageResults: JSON.parse(row.stage_results || '{}'),
-      opinions: JSON.parse(row.opinions || '{}'),
-      votes: JSON.parse(row.votes || '{}'),
-      inquiries: JSON.parse(row.inquiries || '{}'),
-      inquiryResponses: JSON.parse(row.inquiry_responses || '{}'),
-      finalDecision: row.final_decision,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
-      completedAt: row.completed_at
+      participants: JSON.parse(row.participants || '{"cppcc":[],"npc":[]}'),
+      context: JSON.parse(row.context || '{"background":"","history":[],"constraints":[],"successCriteria":[]}'),
+      decisions: JSON.parse(row.decisions || '[]')
     };
   }
   
-  /**
-   * 判断是否为 JSON 字段
-   */
-  _isJsonField(key) {
-    const jsonFields = [
-      'participants', 'expertiseBindings', 'stageResults',
-      'opinions', 'votes', 'inquiries', 'inquiryResponses'
-    ];
-    return jsonFields.includes(key);
+  _computeChecksum(data) {
+    const content = JSON.stringify(data);
+    return crypto.createHash('sha256').update(content).digest('hex').substring(0, 16);
   }
   
   /**
-   * 驼峰转下划线
+   * 获取统计信息（符合 HealthCheckResponse.metrics）
    */
-  _camelToSnake(str) {
-    return str.replace(/([A-Z])/g, '_$1').toLowerCase();
+  getStats() {
+    return {
+      meetings: this.db.prepare('SELECT COUNT(*) as count FROM meetings').get().count,
+      snapshots: this.db.prepare('SELECT COUNT(*) as count FROM state_snapshots').get().count,
+      agents: this.db.prepare('SELECT COUNT(*) as count FROM agent_status').get().count,
+      cacheSize: this.cache.size
+    };
   }
   
-  /**
-   * 关闭数据库连接
-   */
   close() {
     if (this.db) {
       this.db.close();
       this.db = null;
-      this.isInitialized = false;
     }
     this.cache.clear();
   }
-  
-  /**
-   * 获取统计信息
-   */
-  getStats() {
-    const stats = {
-      meetings: this.db.prepare('SELECT COUNT(*) as count FROM meetings').get().count,
-      messages: this.db.prepare('SELECT COUNT(*) as count FROM message_log').get().count,
-      agents: this.db.prepare('SELECT COUNT(*) as count FROM agent_states').get().count,
-      cacheSize: this.cache.size
-    };
-    
-    return stats;
-  }
 }
 
-module.exports = { StateManager };
+module.exports = { StateManager, CONTRACT_VERSION };

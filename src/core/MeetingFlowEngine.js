@@ -1,41 +1,50 @@
 /**
- * MeetingFlowEngine - 会议流程引擎
+ * MeetingFlowEngine - 会议流程引擎（符合契约 v1）
  * @author cppcc-2 (后端专家)
- * @version 1.0.0
+ * @version 2.0.0 - 契约合规版
+ * @contract contracts/api.ts
  * 
  * 功能：
- * - 会议流程编排
- * - 阶段执行调度
- * - 状态同步
- * - 错误恢复
- * 
- * 验收标准：
- * - 流程执行可靠性 100%
- * - 状态一致性保证
+ * - 七步闭环流程编排
+ * - 状态转换符合 MeetingStatus
+ * - 事件发送符合 MeetingEvent
  */
 
 const EventEmitter = require('events');
 const { v4: uuidv4 } = require('uuid');
 
-// 导入流程配置
-const {
-  getFlowConfig,
-  CONSULTATION_FLOW,
-  STRATEGIC_FLOW,
-  RESOLUTION_FLOW
-} = require('../meeting-flow-independent');
+/** 契约版本号 */
+const CONTRACT_VERSION = 1;
 
-/**
- * 会议流程引擎
- */
+/** 会议状态枚举（符合 MeetingStatus） */
+const MeetingStatus = {
+  PENDING: 'pending',
+  STEP1_ALIGNMENT: 'step1-alignment',
+  STEP2_INFORMATION: 'step2-information',
+  STEP3_ROLES: 'step3-roles',
+  STEP4_COORDINATION: 'step4-coordination',
+  STEP5_DELIBERATION: 'step5-deliberation',
+  STEP6_VOTING: 'step6-voting',
+  STEP7_DECISION: 'step7-decision',
+  COMPLETED: 'completed',
+  CANCELLED: 'cancelled'
+};
+
+/** 事件类型枚举（符合 MeetingEventType） */
+const MeetingEventType = {
+  CREATED: 'meeting:created',
+  STARTED: 'meeting:started',
+  STEP_CHANGED: 'step:changed',
+  OPINION_SUBMITTED: 'opinion:submitted',
+  STANCE_RECORDED: 'stance:recorded',
+  INQUIRY_CREATED: 'inquiry:created',
+  INQUIRY_ANSWERED: 'inquiry:answered',
+  VOTE_CAST: 'vote:cast',
+  DECISION_MADE: 'decision:made',
+  COMPLETED: 'meeting:completed'
+};
+
 class MeetingFlowEngine extends EventEmitter {
-  /**
-   * 创建流程引擎
-   * @param {Object} options 配置选项
-   * @param {Object} options.stateManager 状态管理器
-   * @param {Object} options.messageAdapter 消息适配器
-   * @param {Object} options.agentCoordinator Agent协调器
-   */
   constructor(options = {}) {
     super();
     
@@ -43,13 +52,7 @@ class MeetingFlowEngine extends EventEmitter {
     this.messageAdapter = options.messageAdapter;
     this.agentCoordinator = options.agentCoordinator;
     
-    // 活跃会议映射
     this.activeMeetings = new Map();
-    
-    // 阶段执行器映射
-    this.stageExecutors = new Map();
-    
-    // 统计信息
     this.stats = {
       totalMeetings: 0,
       activeMeetings: 0,
@@ -61,434 +64,379 @@ class MeetingFlowEngine extends EventEmitter {
   // ==================== 会议生命周期 ====================
   
   /**
-   * 创建会议
+   * 创建会议（符合 Meeting 接口）
    * @param {Object} config 会议配置
+   * @returns {Promise<{meetingId: string, meeting: Meeting}>}
    */
   async createMeeting(config) {
-    const meetingId = config.meetingId || uuidv4();
-    const meetingType = config.meetingType || 'CONSULTATION';
+    const meetingId = config.id || uuidv4();
+    const now = Date.now();
     
-    // 获取流程配置
-    const flow = getFlowConfig(meetingType);
-    
-    // 估算时长（简单计算）
-    const estimatedDuration = flow.stages 
-      ? `${flow.stages.length * 10} 分钟`
-      : '未知';
-    
-    // 创建会议状态
-    const meetingState = {
+    const meeting = {
       id: meetingId,
-      meetingType,
-      flowType: flow.type,
+      version: CONTRACT_VERSION,
       topic: config.topic,
-      description: config.description || '',
-      
-      // 参与者
+      type: config.type || 'proposal-review',
+      status: MeetingStatus.PENDING,
+      createdAt: now,
+      updatedAt: now,
       participants: config.participants || { cppcc: [], npc: [] },
-      expertiseBindings: config.expertiseBindings || {},
+      context: config.context || {
+        background: '',
+        history: [],
+        constraints: [],
+        successCriteria: []
+      },
+      decisions: [],
       
-      // 流程状态
-      currentStageIndex: -1,
-      currentStage: null,
-      stageResults: {},
-      
-      // 收集器 ID 映射
-      collectionIds: {},
-      
-      // 状态
-      status: 'initialized',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
+      // 内部状态
+      _currentStep: 0,
+      _opinions: {},
+      _stances: {},
+      _inquiries: {},
+      _votes: {}
     };
     
-    // 持久化状态
+    // 持久化
     if (this.stateManager) {
-      this.stateManager.createMeeting(meetingState);
+      this.stateManager.createMeeting(meeting);
     }
     
-    // 添加到活跃会议
-    this.activeMeetings.set(meetingId, meetingState);
+    this.activeMeetings.set(meetingId, meeting);
     this.stats.totalMeetings++;
     this.stats.activeMeetings++;
     
-    this.emit('meeting:created', { meetingId, meetingType, topic: config.topic });
+    // 发送事件
+    this._emitEvent(MeetingEventType.CREATED, meetingId, {
+      topic: meeting.topic,
+      type: meeting.type,
+      context: meeting.context
+    });
     
-    return {
-      meetingId,
-      flow: {
-        type: flow.type,
-        name: flow.name,
-        totalStages: flow.stages ? flow.stages.length : 0,
-        estimatedDuration
-      },
-      status: 'initialized'
-    };
+    return { meetingId, meeting };
   }
   
   /**
    * 开始会议
-   * @param {string} meetingId 会议 ID
+   * @param {string} meetingId 会议ID
    */
   async startMeeting(meetingId) {
     const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
-    }
-    
-    if (meeting.status !== 'initialized' && meeting.status !== 'paused') {
+    if (meeting.status !== MeetingStatus.PENDING) {
       throw new Error(`会议状态不允许启动: ${meeting.status}`);
     }
     
-    meeting.status = 'in_progress';
-    meeting.startedAt = new Date().toISOString();
-    
-    // 更新状态
-    this._updateMeetingState(meetingId, { status: 'in_progress' });
-    
-    this.emit('meeting:started', { meetingId });
-    
-    // 开始第一阶段
-    return this.nextStage(meetingId);
+    // 进入步骤1
+    return this._advanceStep(meetingId, MeetingStatus.STEP1_ALIGNMENT);
   }
   
   /**
-   * 执行下一阶段
-   * @param {string} meetingId 会议 ID
+   * 推进到下一步
+   * @param {string} meetingId 会议ID
    */
-  async nextStage(meetingId) {
+  async nextStep(meetingId) {
     const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
+    const stepOrder = [
+      MeetingStatus.STEP1_ALIGNMENT,
+      MeetingStatus.STEP2_INFORMATION,
+      MeetingStatus.STEP3_ROLES,
+      MeetingStatus.STEP4_COORDINATION,
+      MeetingStatus.STEP5_DELIBERATION,
+      MeetingStatus.STEP6_VOTING,
+      MeetingStatus.STEP7_DECISION,
+      MeetingStatus.COMPLETED
+    ];
+    
+    const currentIndex = stepOrder.indexOf(meeting.status);
+    if (currentIndex < 0 || currentIndex >= stepOrder.length - 1) {
+      throw new Error(`无法推进: ${meeting.status}`);
     }
     
-    const flow = getFlowConfig(meeting.meetingType);
-    
-    // 检查是否还有下一阶段
-    if (meeting.currentStageIndex >= flow.stages.length - 1) {
-      return this.completeMeeting(meetingId);
-    }
-    
-    // 移动到下一阶段
-    meeting.currentStageIndex++;
-    const stage = flow.stages[meeting.currentStageIndex];
-    meeting.currentStage = stage.id;
-    
-    // 更新状态
-    this._updateMeetingState(meetingId, {
-      currentStageIndex: meeting.currentStageIndex,
-      currentStage: stage.id
-    });
-    
-    this.emit('stage:started', {
-      meetingId,
-      stageId: stage.id,
-      stageName: stage.name,
-      stageIndex: meeting.currentStageIndex
-    });
-    
-    // 执行阶段
-    const stageResult = await this._executeStage(meetingId, stage);
-    
-    return stageResult;
+    const nextStatus = stepOrder[currentIndex + 1];
+    return this._advanceStep(meetingId, nextStatus);
   }
   
   /**
-   * 完成当前阶段
-   * @param {string} meetingId 会议 ID
-   * @param {Object} result 阶段结果
+   * 内部：推进步骤
    */
-  async completeStage(meetingId, result) {
+  async _advanceStep(meetingId, newStatus) {
     const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
+    const previousStatus = meeting.status;
+    meeting.status = newStatus;
+    meeting.updatedAt = Date.now();
+    meeting._currentStep = this._statusToStep(newStatus);
+    
+    // 更新持久化
+    if (this.stateManager) {
+      this.stateManager.updateMeetingStatus(meetingId, newStatus);
+      
+      // 创建快照
+      this.stateManager.createSnapshot(meetingId, meeting._currentStep, {
+        status: newStatus,
+        opinions: meeting._opinions,
+        votes: meeting._votes
+      });
     }
     
-    const flow = getFlowConfig(meeting.meetingType);
-    const stage = flow.stages[meeting.currentStageIndex];
-    
-    // 记录阶段结果
-    meeting.stageResults[stage.id] = {
-      ...result,
-      completedAt: new Date().toISOString()
-    };
-    
-    // 更新状态
-    this._updateMeetingState(meetingId, {
-      stageResults: meeting.stageResults
+    // 发送事件
+    this._emitEvent(MeetingEventType.STEP_CHANGED, meetingId, {
+      fromStep: this._statusToStep(previousStatus),
+      toStep: meeting._currentStep,
+      reason: '正常推进'
     });
     
-    this.emit('stage:completed', {
-      meetingId,
-      stageId: stage.id,
-      stageName: stage.name,
-      result
-    });
-    
-    // 检查是否并行阶段且需要等待
-    if (stage.parallel && this.agentCoordinator) {
-      const collectionId = meeting.collectionIds[stage.id];
-      if (collectionId) {
-        await this.agentCoordinator.waitForCompletion(collectionId);
-      }
+    // 如果完成
+    if (newStatus === MeetingStatus.COMPLETED) {
+      this.stats.completedMeetings++;
+      this.stats.activeMeetings--;
+      
+      this._emitEvent(MeetingEventType.COMPLETED, meetingId, {
+        decisions: meeting.decisions
+      });
     }
-    
-    // 继续下一阶段
-    return this.nextStage(meetingId);
-  }
-  
-  /**
-   * 完成会议
-   * @param {string} meetingId 会议 ID
-   */
-  async completeMeeting(meetingId) {
-    const meeting = this.activeMeetings.get(meetingId);
-    
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
-    }
-    
-    meeting.status = 'completed';
-    meeting.completedAt = new Date().toISOString();
-    
-    // 更新状态
-    this._updateMeetingState(meetingId, {
-      status: 'completed',
-      completedAt: meeting.completedAt
-    });
-    
-    // 更新统计
-    this.stats.completedMeetings++;
-    this.stats.activeMeetings--;
-    
-    this.emit('meeting:completed', { meetingId, stageResults: meeting.stageResults });
     
     return {
       meetingId,
-      status: 'completed',
-      completedAt: meeting.completedAt,
-      stageResults: meeting.stageResults
+      status: newStatus,
+      step: meeting._currentStep
     };
   }
   
-  /**
-   * 暂停会议
-   * @param {string} meetingId 会议 ID
-   * @param {string} reason 暂停原因
-   */
-  pauseMeeting(meetingId, reason = null) {
-    const meeting = this.activeMeetings.get(meetingId);
-    
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
-    }
-    
-    meeting.status = 'paused';
-    meeting.pauseReason = reason;
-    
-    this._updateMeetingState(meetingId, { status: 'paused' });
-    
-    this.emit('meeting:paused', { meetingId, reason });
-    
-    return { meetingId, status: 'paused' };
-  }
+  // ==================== 步骤操作 ====================
   
   /**
-   * 恢复会议
-   * @param {string} meetingId 会议 ID
+   * 提交意见（步骤5）
+   * @param {string} meetingId 会议ID
+   * @param {string} agentId Agent ID
+   * @param {string} opinion 意见内容
    */
-  resumeMeeting(meetingId) {
+  async submitOpinion(meetingId, agentId, opinion) {
     const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    if (!meeting) {
-      throw new Error(`会议不存在: ${meetingId}`);
+    if (meeting.status !== MeetingStatus.STEP5_DELIBERATION) {
+      throw new Error(`当前步骤不允许提交意见: ${meeting.status}`);
     }
     
-    if (meeting.status !== 'paused') {
-      throw new Error(`会议状态不允许恢复: ${meeting.status}`);
-    }
-    
-    meeting.status = 'in_progress';
-    delete meeting.pauseReason;
-    
-    this._updateMeetingState(meetingId, { status: 'in_progress' });
-    
-    this.emit('meeting:resumed', { meetingId });
-    
-    return { meetingId, status: 'in_progress' };
-  }
-  
-  // ==================== 阶段执行 ====================
-  
-  /**
-   * 执行阶段
-   * @param {string} meetingId 会议 ID
-   * @param {Object} stage 阶段配置
-   */
-  async _executeStage(meetingId, stage) {
-    const meeting = this.activeMeetings.get(meetingId);
-    
-    // 根据阶段配置选择执行策略
-    const result = {
-      stageId: stage.id,
-      stageName: stage.name,
-      participants: stage.participants,
-      activities: stage.activities,
-      outputs: stage.outputs
+    meeting._opinions[agentId] = {
+      agentId,
+      opinion,
+      timestamp: Date.now()
     };
     
-    // 如果需要收集响应，启动收集器
-    if (stage.parallel && this.agentCoordinator && stage.participants.length > 0) {
-      const expectedAgents = this._resolveParticipants(meeting, stage.participants);
-      
-      const collection = this.agentCoordinator.startCollection({
-        meetingId,
-        stage: stage.id,
-        expectedAgents,
-        timeout: this._parseDuration(stage.duration)
-      });
-      
-      meeting.collectionIds[stage.id] = collection.collectionId;
-      
-      // 发送消息给参与者
-      if (this.messageAdapter) {
-        await this.messageAdapter.broadcast(expectedAgents, {
-          type: 'stage:execute',
-          meetingId,
-          stageId: stage.id,
-          stageName: stage.name,
-          activities: stage.activities,
-          outputs: stage.outputs
-        });
-      }
-      
-      result.collectionId = collection.collectionId;
-      result.expectedAgents = expectedAgents;
-    }
+    // 发送事件
+    this._emitEvent(MeetingEventType.OPINION_SUBMITTED, meetingId, {
+      agentId,
+      opinion,
+      step: 5
+    });
     
-    return result;
+    return { success: true, recorded: true };
   }
   
   /**
-   * 解析参与者列表
+   * 记录立场（步骤5-2）
+   * @param {string} meetingId 会议ID
+   * @param {string} agentId Agent ID
+   * @param {Stance} stance 立场
+   * @param {string} reason 理由
    */
-  _resolveParticipants(meeting, participantTypes) {
-    const agents = [];
-    
-    for (const type of participantTypes) {
-      if (type === '政协委员' || type === 'cppcc') {
-        agents.push(...(meeting.participants.cppcc || []));
-      } else if (type === '人大代表' || type === 'npc') {
-        agents.push(...(meeting.participants.npc || []));
-      }
-    }
-    
-    return agents;
-  }
-  
-  /**
-   * 解析时长
-   */
-  _parseDuration(duration) {
-    if (!duration) return 60000;
-    
-    const match = duration.match(/(\d+)\s*(分钟|小时|秒)/);
-    if (!match) return 60000;
-    
-    const value = parseInt(match[1]);
-    const unit = match[2];
-    
-    switch (unit) {
-      case '秒': return value * 1000;
-      case '分钟': return value * 60 * 1000;
-      case '小时': return value * 60 * 60 * 1000;
-      default: return 60000;
-    }
-  }
-  
-  // ==================== 状态管理 ====================
-  
-  /**
-   * 更新会议状态
-   */
-  _updateMeetingState(meetingId, updates) {
+  async recordStance(meetingId, agentId, stance, reason) {
     const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
     
-    if (meeting) {
-      Object.assign(meeting, updates, { updatedAt: new Date().toISOString() });
+    const validStances = ['endorse', 'supplement', 'oppose', 'independent'];
+    if (!validStances.includes(stance)) {
+      throw new Error(`无效立场: ${stance}`);
     }
     
-    // 持久化
+    meeting._stances[agentId] = {
+      agentId,
+      stance,
+      reason,
+      timestamp: Date.now()
+    };
+    
+    // 更新 participants
+    const participant = meeting.participants.cppcc.find(p => p.id === agentId);
+    if (participant) {
+      participant.stance = stance;
+    }
+    
+    this._emitEvent(MeetingEventType.STANCE_RECORDED, meetingId, {
+      agentId,
+      stance,
+      reason
+    });
+    
+    return { success: true };
+  }
+  
+  /**
+   * 投票（步骤6）
+   * @param {string} meetingId 会议ID
+   * @param {string} agentId Agent ID
+   * @param {Vote} vote 投票
+   * @param {string} reason 理由
+   */
+  async castVote(meetingId, agentId, vote, reason) {
+    const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
+    
+    if (meeting.status !== MeetingStatus.STEP6_VOTING) {
+      throw new Error(`当前步骤不允许投票: ${meeting.status}`);
+    }
+    
+    const validVotes = ['approve', 'reject', 'abstain'];
+    if (!validVotes.includes(vote)) {
+      throw new Error(`无效投票: ${vote}`);
+    }
+    
+    meeting._votes[agentId] = {
+      voter: agentId,
+      vote,
+      reason,
+      castAt: Date.now()
+    };
+    
+    // 更新 participants
+    const participant = meeting.participants.npc.find(p => p.id === agentId);
+    if (participant) {
+      participant.vote = vote;
+    }
+    
+    this._emitEvent(MeetingEventType.VOTE_CAST, meetingId, {
+      voterId: agentId,
+      vote,
+      reason
+    });
+    
+    return { success: true };
+  }
+  
+  /**
+   * 做出决策（步骤7）
+   * @param {string} meetingId 会议ID
+   * @param {string} content 决策内容
+   * @param {string} rationale 理由
+   */
+  async makeDecision(meetingId, content, rationale) {
+    const meeting = this.activeMeetings.get(meetingId);
+    if (!meeting) throw new Error(`会议不存在: ${meetingId}`);
+    
+    if (meeting.status !== MeetingStatus.STEP7_DECISION) {
+      throw new Error(`当前步骤不允许决策: ${meeting.status}`);
+    }
+    
+    // 统计投票
+    const votes = Object.values(meeting._votes);
+    const voteSummary = {
+      approve: votes.filter(v => v.vote === 'approve').length,
+      reject: votes.filter(v => v.vote === 'reject').length,
+      abstain: votes.filter(v => v.vote === 'abstain').length
+    };
+    
+    const passed = voteSummary.approve > voteSummary.reject;
+    
+    const decision = {
+      id: uuidv4(),
+      content,
+      rationale,
+      timestamp: Date.now(),
+      votes: Object.values(meeting._votes)
+    };
+    
+    meeting.decisions.push(decision);
+    
     if (this.stateManager) {
-      this.stateManager.updateMeeting(meetingId, updates);
+      this.stateManager.recordDecision(meetingId, decision);
+    }
+    
+    this._emitEvent(MeetingEventType.DECISION_MADE, meetingId, {
+      decision: content,
+      voteSummary,
+      passed
+    });
+    
+    // 进入完成状态
+    await this._advanceStep(meetingId, MeetingStatus.COMPLETED);
+    
+    return {
+      decision,
+      voteSummary,
+      passed
+    };
+  }
+  
+  // ==================== 工具方法 ====================
+  
+  _statusToStep(status) {
+    const stepMap = {
+      'pending': 0,
+      'step1-alignment': 1,
+      'step2-information': 2,
+      'step3-roles': 3,
+      'step4-coordination': 4,
+      'step5-deliberation': 5,
+      'step6-voting': 6,
+      'step7-decision': 7,
+      'completed': 8,
+      'cancelled': -1
+    };
+    return stepMap[status] || 0;
+  }
+  
+  _emitEvent(eventType, meetingId, payload) {
+    const event = {
+      eventId: uuidv4(),
+      version: CONTRACT_VERSION,
+      eventType,
+      meetingId,
+      payload,
+      timestamp: Date.now(),
+      source: 'MeetingFlowEngine'
+    };
+    
+    this.emit('event', event);
+    
+    if (this.messageAdapter) {
+      this.messageAdapter.broadcast(meetingId, {
+        type: 'step:notification',
+        from: 'MeetingFlowEngine',
+        payload: event
+      }).catch(err => console.error('事件发送失败:', err));
     }
   }
   
   /**
    * 获取会议状态
-   * @param {string} meetingId 会议 ID
    */
-  getMeetingState(meetingId) {
+  getMeeting(meetingId) {
     return this.activeMeetings.get(meetingId);
   }
   
   /**
    * 获取进度
-   * @param {string} meetingId 会议 ID
    */
   getProgress(meetingId) {
     const meeting = this.activeMeetings.get(meetingId);
-    
-    if (!meeting) {
-      return null;
-    }
-    
-    const flow = getFlowConfig(meeting.meetingType);
+    if (!meeting) return null;
     
     return {
       meetingId,
       status: meeting.status,
-      currentStageIndex: meeting.currentStageIndex,
-      totalStages: flow.stages.length,
-      percentage: Math.round((meeting.currentStageIndex + 1) / flow.stages.length * 100),
-      currentStage: meeting.currentStage,
-      stageResults: meeting.stageResults
+      step: meeting._currentStep,
+      totalSteps: 7,
+      percentage: Math.round((meeting._currentStep / 7) * 100),
+      decisions: meeting.decisions.length
     };
   }
-  
-  // ==================== 恢复 ====================
-  
-  /**
-   * 恢复会议执行
-   * @param {string} meetingId 会议 ID
-   */
-  async resumeFromPersisted(meetingId) {
-    if (!this.stateManager) {
-      throw new Error('StateManager 未配置');
-    }
-    
-    const meetingState = this.stateManager.getMeeting(meetingId);
-    
-    if (!meetingState) {
-      throw new Error(`会议不存在: ${meetingId}`);
-    }
-    
-    // 添加到活跃会议
-    this.activeMeetings.set(meetingId, meetingState);
-    this.stats.activeMeetings++;
-    
-    // 恢复状态
-    if (meetingState.status === 'in_progress') {
-      this.emit('meeting:recovered', { meetingId, stage: meetingState.currentStage });
-    }
-    
-    return meetingState;
-  }
-  
-  // ==================== 统计 ====================
   
   /**
    * 获取统计信息
@@ -501,4 +449,9 @@ class MeetingFlowEngine extends EventEmitter {
   }
 }
 
-module.exports = { MeetingFlowEngine };
+module.exports = {
+  MeetingFlowEngine,
+  MeetingStatus,
+  MeetingEventType,
+  CONTRACT_VERSION
+};

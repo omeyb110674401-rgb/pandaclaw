@@ -1,0 +1,230 @@
+/**
+ * PandaClaw UI - 补充样式
+ */
+
+/* 投票面板样式补充 */
+.vote-summary {
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.vote-summary.passed {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+}
+
+.vote-summary.rejected {
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+}
+
+.vote-result-text {
+  font-weight: bold;
+  font-size: 16px;
+}
+
+.vote-count {
+  color: #666;
+  font-size: 14px;
+}
+
+/* 投票条形图 */
+.vote-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+.vote-bar-container {
+  position: relative;
+  height: 32px;
+  background: #f0f0f0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.vote-bar {
+  height: 100%;
+  transition: width 0.3s ease;
+}
+
+.vote-bar.approve {
+  background: var(--success-color);
+}
+
+.vote-bar.reject {
+  background: var(--error-color);
+}
+
+.vote-bar.abstain {
+  background: #999;
+}
+
+.vote-bar-label {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 14px;
+  color: #333;
+}
+
+/* 投票详情 */
+.vote-details {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.decision-content {
+  padding: 16px;
+  background: var(--bg-color);
+  border-radius: 8px;
+  margin: 12px 0;
+  line-height: 1.6;
+}
+
+.decision-rationale {
+  font-size: 14px;
+  color: #666;
+  margin-top: 8px;
+}
+
+/* 上下文面板 */
+.context-panel {
+  background: var(--card-bg);
+  padding: 24px;
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+
+.context-panel h3 {
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.context-panel h4 {
+  margin-top: 16px;
+  margin-bottom: 8px;
+  font-size: 14px;
+  color: #666;
+}
+
+.context-panel p {
+  line-height: 1.6;
+}
+
+.context-panel ul {
+  margin-left: 20px;
+}
+
+.context-panel li {
+  margin: 8px 0;
+}
+
+/* 仪表盘头部 */
+.dashboard-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.meeting-info {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.meeting-info h2 {
+  font-size: 24px;
+  margin: 0;
+}
+
+.meeting-type {
+  padding: 4px 12px;
+  background: var(--primary-color);
+  color: white;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+/* 状态标签样式 */
+.participant-status {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.status-endorse, .status-approve {
+  background: #e6f7ff;
+  color: var(--primary-color);
+}
+
+.status-supplement {
+  background: #fff7e6;
+  color: var(--warning-color);
+}
+
+.status-oppose, .status-reject {
+  background: #fff2f0;
+  color: var(--error-color);
+}
+
+.status-independent, .status-abstain {
+  background: #f0f0f0;
+  color: #999;
+}
+
+/* 实时状态指示 */
+.live-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 20px;
+  font-size: 12px;
+}
+
+.live-indicator.connected {
+  background: #f6ffed;
+  color: var(--success-color);
+}
+
+.live-indicator.disconnected {
+  background: #fff2f0;
+  color: var(--error-color);
+}
+
+.live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.live-dot.active {
+  background: var(--success-color);
+  animation: pulse 2s infinite;
+}
+
+.live-dot.inactive {
+  background: var(--error-color);
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(0.8);
+  }
+}

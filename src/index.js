@@ -14,6 +14,26 @@
 const { StateManager, AgentCoordinator, MeetingFlowEngine } = require('./core');
 const { MessageAdapter, FastPathChannel, ReliablePathChannel } = require('./messaging');
 
+// 容错层（DevOps专家 - cppcc-1）
+const { 
+  CircuitBreakerManager,
+  RetryPolicy,
+  DeadLetterQueue,
+  HealthChecker,
+  ResilienceLayer,
+  RetryStrategies,
+  DependencyCheckers,
+} = require('./resilience');
+
+// 可观测层（DevOps专家 - cppcc-1）
+const { 
+  MetricsCollector,
+  AlertManager,
+  AlertNotifier,
+  ObservabilityLayer,
+  createMetricsHandler,
+} = require('./observability');
+
 // 现有模块（兼容）
 const DemocraticMeetingSystem = require('./democratic-meeting-system');
 const MeetingFlowExecutor = require('./meeting-flow-executor');
@@ -52,11 +72,25 @@ function createPandaClaw(options = {}) {
     agentCoordinator
   });
   
+  // 初始化容错层（可选，需 Redis）
+  let resilienceLayer = null;
+  if (options.redisClient) {
+    resilienceLayer = new ResilienceLayer(options.redisClient, options.resilience);
+  }
+  
+  // 初始化可观测层（可选，需 Redis）
+  let observabilityLayer = null;
+  if (options.redisClient) {
+    observabilityLayer = new ObservabilityLayer(options.redisClient, options.observability);
+  }
+  
   return {
     stateManager,
     messageAdapter,
     agentCoordinator,
     flowEngine,
+    resilienceLayer,
+    observabilityLayer,
     
     /**
      * 创建会议
@@ -73,6 +107,26 @@ function createPandaClaw(options = {}) {
     },
     
     /**
+     * 获取健康报告
+     */
+    async getHealthReport() {
+      if (resilienceLayer) {
+        return resilienceLayer.getHealthReport();
+      }
+      return { healthy: true, message: 'Resilience layer not initialized' };
+    },
+    
+    /**
+     * 获取 Prometheus 指标
+     */
+    async getMetrics() {
+      if (observabilityLayer) {
+        return observabilityLayer.getMetrics();
+      }
+      return '# Resilience layer not initialized';
+    },
+    
+    /**
      * 获取统计信息
      */
     getStats() {
@@ -80,7 +134,9 @@ function createPandaClaw(options = {}) {
         state: stateManager.getStats(),
         messaging: messageAdapter.getStats(),
         coordination: agentCoordinator.getStats(),
-        flow: flowEngine.getStats()
+        flow: flowEngine.getStats(),
+        resilience: resilienceLayer ? 'active' : 'inactive',
+        observability: observabilityLayer ? observabilityLayer.getStats() : null,
       };
     },
     
@@ -89,6 +145,8 @@ function createPandaClaw(options = {}) {
      */
     async close() {
       await messageAdapter.close();
+      if (resilienceLayer) await resilienceLayer.close();
+      if (observabilityLayer) await observabilityLayer.close();
       stateManager.close();
     }
   };
@@ -103,6 +161,22 @@ module.exports = {
   MessageAdapter,
   FastPathChannel,
   ReliablePathChannel,
+  
+  // 容错层
+  CircuitBreakerManager,
+  RetryPolicy,
+  DeadLetterQueue,
+  HealthChecker,
+  ResilienceLayer,
+  RetryStrategies,
+  DependencyCheckers,
+  
+  // 可观测层
+  MetricsCollector,
+  AlertManager,
+  AlertNotifier,
+  ObservabilityLayer,
+  createMetricsHandler,
   
   // 兼容旧模块
   DemocraticMeetingSystem,
