@@ -1,5 +1,9 @@
 /**
- * 会议舞台：一场或多场会议的程序进度、席位名册、计票历史与记录流.
+ * 会议舞台：各案卷（议题）的程序进度、名册、计票历史与记录流.
+ *
+ * 口径纪律：卡片与统计的领域单元是**案卷**（ADR-0001：案卷号不是会议的
+ * 编号），「会议」一词只出现在引导开会的动作语境；名册在实现里暂挂案卷
+ * doc（一会一卷合流），多案卷一会落地时投影再加会议层.
  *
  * 纯函数组件＋组件内筛选状态：全部数据来自 `useBoard` 选择器钩子（slots
  * 框架由 inject 面的 hooks.board 生成），无外部订阅、无副作用；样式用内联
@@ -29,7 +33,7 @@ const KIND_LABELS: Record<string, string> = {
   vote: '选票',
   resolution: '决议',
   ruling: '裁定',
-  rebind: '席位重绑',
+  rebind: '认证重绑',
 }
 
 /** 席位徽记与配色（协=蓝 / 审=绿 / 主=红）. */
@@ -162,7 +166,7 @@ function TemplateCard(props: {
   )
 }
 
-/** 计票历史：一场会议的全部轮次，最新一行着底色强调；征询模式强制标注. */
+/** 计票历史：一个案卷的全部轮次，最新一行着底色强调；征询模式强制标注. */
 function TallyHistory(props: { readonly tallies: readonly PcTallyView[]; readonly docId: string }): ReturnType<typeof h> | null {
   const mine = props.tallies.filter(tally => tally.docId === props.docId)
   if (mine.length === 0) return null
@@ -267,7 +271,7 @@ function StageNow(props: { readonly meeting: PcMeetingView }): ReturnType<typeof
     `${STATUS_LABELS[meeting.status] ?? meeting.status}于 ${formatRelative(meeting.closedAt)}`)
 }
 
-/** 一场会议卡片. */
+/** 一个案卷的卡片. */
 function MeetingCard(props: {
   readonly meeting: PcMeetingView
   readonly tallies: readonly PcTallyView[]
@@ -280,11 +284,11 @@ function MeetingCard(props: {
     style: { background: palette.card, border: `1px solid ${palette.border}`, borderRadius: 10, padding: '12px 14px', marginBottom: 12 },
   },
     h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' } },
-      h('strong', { style: { fontSize: 14 } }, meeting.docId),
+      h('strong', { style: { fontSize: 14 } }, `案卷号 ${meeting.docId}`),
       chip(TYPE_LABELS[meeting.type] ?? meeting.type, typeColor, true),
       chip(`${TIER_LABELS[meeting.tier] ?? meeting.tier} · ${VALIDATION_LABELS[meeting.validation] ?? meeting.validation}`, palette.dim, false),
       chip(STATUS_LABELS[meeting.status] ?? meeting.status, meeting.status === 'open' ? palette.ok : palette.dim, meeting.status === 'open'),
-      h('span', { style: { color: palette.dim, fontSize: 11 } }, `开于 ${formatRelative(meeting.createdAt)}`),
+      h('span', { style: { color: palette.dim, fontSize: 11 } }, `立案于 ${formatRelative(meeting.createdAt)}`),
     ),
     h('div', { style: { color: palette.dim, fontSize: 12, margin: '4px 0 2px' } }, `议题：${meeting.topic}`),
     h(StageNow, { meeting }),
@@ -323,7 +327,7 @@ function BoardHeader(props: {
   const { openCount, closedCount, recordCount, status, adjournedCount, terminatedCount, onPick } = props
   return h('div', { style: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 12 } },
     h('span', { style: { fontSize: 12, color: palette.dim, marginRight: 8 } },
-      `${String(openCount)} 场进行中 · ${String(closedCount)} 场已结 · ${String(recordCount)} 条记录`),
+      `${String(openCount)} 案进行中 · ${String(closedCount)} 案已结 · ${String(recordCount)} 条记录`),
     filterChip('全部', openCount + closedCount, status === 'all', () => onPick('all')),
     filterChip('进行中', openCount, status === 'open', () => onPick('open')),
     adjournedCount > 0 ? filterChip('已归档', adjournedCount, status === 'adjourned', () => onPick('adjourned')) : null,
@@ -332,7 +336,7 @@ function BoardHeader(props: {
 }
 
 /**
- * 视图页签根组件：空看板露出快速开始模板；有会时顶栏统计＋筛选＋会议卡列.
+ * 视图页签根组件：空看板露出快速开始模板；有案卷时顶栏统计＋筛选＋案卷卡列.
  * @param props - 注入的看板选择器.
  */
 export function MeetingStage(props: MeetingStageProps): ReturnType<typeof h> {
@@ -344,7 +348,7 @@ export function MeetingStage(props: MeetingStageProps): ReturnType<typeof h> {
     },
       h('div', { style: { maxWidth: 460, margin: '36px auto 0' } },
         h('div', { style: { fontSize: 13, color: palette.dim, marginBottom: 12, lineHeight: 1.6 } },
-          '本会话暂无会议。选一张卡片复制开场白发给助手即可开会；也可以直接说「开个会：〈议题〉」，由助手推荐合适的会议类型。'),
+          '本会话暂无案卷。选一张卡片复制开场白发给助手即可开会；也可以直接说「开个会：〈议题〉」，由助手推荐合适的会议类型。'),
         ...QUICKSTART_TEMPLATES.map(template => h(TemplateCard, {
           key: template.label,
           label: template.label,
@@ -358,7 +362,7 @@ export function MeetingStage(props: MeetingStageProps): ReturnType<typeof h> {
   const adjourned = board.meetings.filter(meeting => meeting.status === 'adjourned')
   const terminated = board.meetings.filter(meeting => meeting.status === 'terminated')
   const visible = status === 'all' ? board.meetings : board.meetings.filter(meeting => meeting.status === status)
-  // 进行中永远排前，组内按开会议时间倒序（新会在上）.
+  // 进行中永远排前，组内按立卷时间倒序（新卷在上）.
   const ordered = [...visible].sort((a, b) => {
     if (a.status !== b.status) return a.status === 'open' ? -1 : 1
     return b.createdAt - a.createdAt

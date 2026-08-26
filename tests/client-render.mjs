@@ -62,6 +62,7 @@ const board = {
     { id: 'a5', docId: 'PC-20260826-CON-01', kind: 'ruling', stage: 'gate', seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '用户批复：放行进入表决', wordCount: 30, at: now - 2_000_000 },
     { id: 'a6', docId: 'PC-20260825-RES-01', kind: 'vote', stage: 'vote', seat: 'cppcc', authorName: '文渊', authorSessionId: 's', preview: '选票：赞成', wordCount: 6, stance: '赞成', at: now - 73_000_000 },
     { id: 'a7', docId: 'PC-20260825-RES-01', kind: 'resolution', stage: 'close', seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '决议：采纳 v1.4.0 UI 方案', wordCount: 88, at: now - 72_000_000 },
+    { id: 'a8', docId: 'PC-20260826-CON-01', kind: 'rebind', stage: 'open', seat: 'npc', authorName: '守拙', authorSessionId: 's2', preview: '断线重启，认证重绑接管席位', wordCount: 26, at: now - 1_000_000 },
   ],
   tallies: [
     { docId: 'PC-20260826-CON-01', stage: 'r2', round: 2, aye: 1, nay: 1, abstain: 0, rosterSize: 3, responded: 2, mode: 'consultive', passed: false, rule: 'double-two-thirds', at: now - 1_500_000 },
@@ -125,11 +126,11 @@ function expectAll(name, html, needles) {
 console.log('▶ 会议看板渲染')
 const html = renderToString(createElement(Component, { useBoard: selector => selector(board) }))
 
-expectAll('顶栏', html, ['1 场进行中', '1 场已结', '7 条记录', '全部 2', '进行中 1', '已归档 1'])
-expectAll('会议卡元信息', html, ['协商', '复杂 · 关键点验收', '开于', '名册（2）'])
+expectAll('顶栏', html, ['1 案进行中', '1 案已结', '8 条记录', '全部 2', '进行中 1', '已归档 1'])
+expectAll('会议卡元信息', html, ['案卷号 PC-20260826-CON-01', '协商', '复杂 · 关键点验收', '立案于', '名册（2）'])
 expectAll('当前阶段行', html, ['当前：', 'R2 草案表决', '· r2', '⭐'])
 expectAll('计票历史', html, ['r2', '赞成 1 · 反对 1 · 弃权 0', '应答 2/3', '征询·不构成表决', '未通过', '通过'])
-expectAll('记录流', html, ['记录流（5 条）', '全部 5', '意见书 2', '裁定', '[协]文渊', '已退回·未达 M4 最低字数', '210字'])
+expectAll('记录流', html, ['记录流（6 条）', '全部 6', '意见书 2', '裁定', '认证重绑', '[协]文渊', '已退回·未达 M4 最低字数', '210字'])
 if (!/border-left:3px solid #c0392b/.test(html)) {
   console.error('  ❌ 决议记录左边框强调缺失')
   failed += 1
@@ -148,7 +149,7 @@ console.log('▶ 空态快速开始渲染')
 const emptyHtml = renderToString(createElement(Component, {
   useBoard: selector => selector({ meetings: [], records: [], tallies: [] }),
 }))
-expectAll('空态', emptyHtml, ['本会话暂无会议', '协商型 · 重大议题', '纪要型 · 例会留痕', '决议型 · 快速拍板', '复制'])
+expectAll('空态', emptyHtml, ['本会话暂无案卷', '协商型 · 重大议题', '纪要型 · 例会留痕', '决议型 · 快速拍板', '复制'])
 
 if (failed > 0) {
   console.error(`❌ 客户端渲染冒烟：${String(failed)} 项断言失败`)
