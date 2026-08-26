@@ -19,8 +19,8 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-/** 必需服务：页签注册表与会话域. */
-export const inject = ['slots', 'sessions']
+/** 必需服务：页签注册表、会话域与区域文案. */
+export const inject = ['slots', 'sessions', 'locale']
 
 /** 视图环位置：紧跟 agent-team 页签之后. */
 const VIEW_ORDER = 21
