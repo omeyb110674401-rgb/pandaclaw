@@ -102,13 +102,14 @@ export function apply(ctx: ClientContext): void {
   }, 'pandaclaw: projection follower')
 
   /**
-   * 页签随会议存在性挂撤：没有会议的会话不长出一个填不满的视图；
-   * 撤页签时活动视图回落到聊天，对读者安全.
+   * 页签随活跃会话挂撤：有会话就挂出「会议舞台」。空看板在视图空态露出
+   * 快速开始模板，引导首场会议；有会时露出会议卡。会话退出时撤页签，
+   * 活动视图回落到聊天，对读者安全.
    */
   ctx.slots.inject('conversation.view', () => {
     let disposeTab: (() => void) | null = null
     const sync = (): void => {
-      const wanted = store.getSnapshot().meetings.length > 0
+      const wanted = followed !== undefined
       if (wanted === (disposeTab !== null)) return
       if (!wanted) {
         disposeTab?.()
@@ -125,8 +126,10 @@ export function apply(ctx: ClientContext): void {
       }, MeetingStage)
     }
     sync()
+    const disposeList = sessions.list.subscribe(sync)
     const disposeStore = store.subscribe(sync)
     return () => {
+      disposeList()
       disposeStore()
       disposeTab?.()
       disposeTab = null
