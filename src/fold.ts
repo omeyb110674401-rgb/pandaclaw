@@ -13,13 +13,13 @@ const MAX_RECORDS = 400
 const MAX_TALLIES = 100
 
 /** 粗校验一条 meta 名下的 PandaClaw 事实（深度形状由投影 wire schema 把关）. */
-function readPcFact(meta: unknown): PcFact | undefined {
+function readPcFact(meta: unknown): Exclude<PcFact, { readonly pc: 'review' }> | undefined {
   if (typeof meta !== 'object' || meta === null) return undefined
   const candidate = (meta as Record<string, unknown>).pandaclaw
   if (typeof candidate !== 'object' || candidate === null) return undefined
   const fact = candidate as Record<string, unknown>
   if (fact.pc !== 'meeting' && fact.pc !== 'record' && fact.pc !== 'tally') return undefined
-  return candidate as PcFact
+  return candidate as Exclude<PcFact, { readonly pc: 'review' }>
 }
 
 /**

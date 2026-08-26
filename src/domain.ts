@@ -8,7 +8,7 @@
 
 import { z } from 'zod'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
-import type { MeetingType, RecordKind, Seat, Tier, Validation } from './protocol.ts'
+import type { MeetingType, RecordKind, ReviewFlag, ReviewState, Seat, Tier, Validation } from './protocol.ts'
 
 /** 一场会议的存储行（行即实体整体，更新走覆盖写）. */
 export const meetingSchema = z.object({
@@ -27,6 +27,21 @@ export const meetingSchema = z.object({
     state: z.union([z.literal('pending'), z.literal('active'), z.literal('done')]),
     round: z.number().optional(),
   })),
+  /** 复审子状态（ADR-0010）：全字段非必填——既有档案行缺省即 idle/无标记，向前兼容. */
+  review: z.object({
+    state: z.string() as z.ZodType<ReviewState>,
+    flag: z.string() as z.ZodType<ReviewFlag>,
+    /** 复审意见条数（逐条回告的计数依据）. */
+    count: z.number(),
+    /** 出口三选裁定（decidable→closed 的落板值）：'revise' | 'interpret' | 'dismiss'. */
+    choice: z.string().optional(),
+    /** 修订出口：新案卷号（修订重议→新卷关联原卷）. */
+    revisedDocId: z.string().optional(),
+    /** 解释出口：原卷追加的解释性 resolution 记录 id. */
+    interpretRecordId: z.string().optional(),
+    /** 待审池出审优先级（服务层机械排序字段）. */
+    priority: z.number().optional(),
+  }).optional(),
   createdAt: z.number(),
   closedAt: z.number().optional(),
 })

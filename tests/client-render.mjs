@@ -51,6 +51,7 @@ const board = {
       topic: '采纳 v1.4.0 UI 方案', status: 'adjourned',
       members: [{ name: '文渊', seat: 'cppcc' }],
       stages: [{ id: 'vote', label: '表决', deliberative: false, state: 'done' }],
+      review: { state: 'closed', flag: 'skip-validation', count: 1, choice: 'dismiss' },
       createdAt: now - 86_400_000, closedAt: now - 72_000_000,
     },
   ],
@@ -133,7 +134,7 @@ expectAll('会议卡元信息', html, ['案卷号 PC-20260826-CON-01', '协商',
 expectAll('当前阶段行', html, ['当前：', 'R2 草案表决', '· r2', '⭐'])
 expectAll('计票历史', html, ['r2', '赞成 1 · 反对 1 · 弃权 0', '应答 2/3', '征询·不构成表决', '未通过', '通过'])
 expectAll('监督窗口', html, ['监督窗口 · 二阶段（替身监督）', '用户回来自动获追认/撤回权'])
-expectAll('复审入口', html, ['复审子通道 · 异步监督', '复制复审意见开场白'])
+expectAll('复审面板', html, ['复审 · 已闭环（意见 1 条）', '案卷 PC-20260825-RES-01 复审已闭环。'])
 expectAll('记录流', html, ['记录流（8 条）', '全部 8', '意见书 2', '监督意见 1', '关窗预告 1', '裁定', '认证重绑', '代·替身', '[协]文渊', '已退回·未达 M4 最低字数', '210字'])
 if (!/border-left:3px solid #c0392b/.test(html)) {
   console.error('  ❌ 决议记录左边框强调缺失')

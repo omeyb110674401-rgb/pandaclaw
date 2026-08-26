@@ -5,7 +5,7 @@
  * 必须可无损过 JSON（投影值走 wire 推送）.
  */
 
-import type { MeetingType, RecordKind, Seat, Tier, Validation } from './protocol.ts'
+import type { MeetingType, RecordKind, ReviewFlag, ReviewState, Seat, Tier, Validation } from './protocol.ts'
 
 /** 投影里的一条会议记录（成员产物/主持人登记的锚点）. */
 export interface PcRecordView {
@@ -64,6 +64,17 @@ export interface PcTallyView {
   readonly at: number
 }
 
+/** 复审子状态视图（ADR-0010）——已归档案卷上跑的六阶段复审状态机. */
+export interface PcReviewView {
+  readonly state: ReviewState
+  readonly flag: ReviewFlag
+  readonly count: number
+  readonly choice?: 'revise' | 'interpret' | 'dismiss'
+  readonly revisedDocId?: string
+  readonly interpretRecordId?: string
+  readonly priority?: number
+}
+
 /** 一场会议的完整视图（整体快照，非增量）. */
 export interface PcMeetingView {
   readonly docId: string
@@ -75,6 +86,7 @@ export interface PcMeetingView {
   readonly members: readonly PcMemberView[]
   readonly stages: readonly PcStageProgress[]
   readonly currentStage?: string
+  readonly review?: PcReviewView
   readonly createdAt: number
   readonly closedAt?: number
 }
@@ -97,3 +109,4 @@ export type PcFact =
   | { readonly pc: 'meeting'; readonly meeting: PcMeetingView }
   | { readonly pc: 'record'; readonly record: PcRecordView }
   | { readonly pc: 'tally'; readonly tally: PcTallyView }
+  | { readonly pc: 'review'; readonly review: PcReviewView; readonly docId: string }

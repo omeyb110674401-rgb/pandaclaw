@@ -36,6 +36,14 @@ const KIND_LABELS: Record<string, string> = {
   rebind: '认证重绑',
   warning: '关窗预告',
   supervision: '监督意见',
+  review: '复审意见',
+  'review-reply': '复审回告',
+}
+
+/** 复审状态中文标签（ADR-0010 六阶段 ＋ 未进入/已闭环）. */
+const REVIEW_STATE_LABELS: Record<string, string> = {
+  filed: '待出审', accepted: '已受理', reviewing: '审查中', hearing: '沟通纠正中',
+  decidable: '待用户三选', feedback: '回告中', closed: '已闭环',
 }
 
 /** 席位徽记与配色（协=蓝 / 审=绿 / 主=红）. */
@@ -356,14 +364,45 @@ function SupervisionWindow(props: {
   )
 }
 
-/** 复审子通道入口（ADR-0006 §113 反馈义务）：已归档案卷上给用户异步监督的复制开场白. */
-function ReviewEntry(props: { readonly meeting: PcMeetingView }): ReturnType<typeof h> | null {
+/**
+ * 复审面板（ADR-0010）：已归档案卷上展示复审状态与动作开场白.
+ * 阶段由服务层 review 字段推导（状态机），UI 只读呈现＋给用户最后一拍的可复制动作文本.
+ */
+function ReviewPanel(props: { readonly meeting: PcMeetingView }): ReturnType<typeof h> | null {
   const { meeting } = props
   if (meeting.status !== 'adjourned') return null
-  const text = `对已归档案卷 ${meeting.docId}「${meeting.topic}」提复审意见：〈意见〉。请主持人逐条回告（反馈义务两级制：收集整理＋汇总通报）。`
+  const review = meeting.review
+  const state = review?.state
+  // 待出审/未进入：给「提复审意见」开场白（用户主动通道，弱/次级档从这里开启）.
+  const requestText = `对已归档案卷 ${meeting.docId}「${meeting.topic}」提复审意见：〈意见〉。请主持人代录登记复审意见（原汁原味不改写，pc_review action=request）。`
+  if (state === undefined || state === 'idle' || state === 'filed') {
+    const inPool = state === 'filed'
+    return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+      chip(inPool ? '复审 · 待出审（已入池）' : '复审通道 · 异步监督', inPool ? palette.warn : '#8e44ad', false),
+      h(Copier, { text: requestText, label: '复制提复审意见' }),
+    )
+  }
+  // 进行中：状态行＋按阶段给动作开场白.
+  const stateLabel = REVIEW_STATE_LABELS[state] ?? state
+  const inProgress = state !== 'closed'
+  const stateColor = state === 'decidable' ? palette.warn : state === 'closed' ? palette.dim : palette.accent
+  const actionText = (() => {
+    switch (state) {
+      case 'reviewing':
+        return `案卷 ${meeting.docId} 复审审查中（审查替身已派发）；待审查意见落板后呈报用户三选。`
+      case 'hearing':
+        return `案卷 ${meeting.docId} 复审沟通纠正中（异议方陈述窗口）；收窗后呈报用户三选。`
+      case 'decidable':
+        return `案卷 ${meeting.docId} 复审已出审查意见，请裁定出口三选：修订重议／解释性决议／驳回并说明（pc_review action=adjudicate）。`
+      case 'feedback':
+        return `案卷 ${meeting.docId} 复审出口已裁，逐条回告中（pc_review action=reply，齐备即闭环）。`
+      default:
+        return `案卷 ${meeting.docId} 复审${stateLabel}。`
+    }
+  })()
   return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
-    chip('复审子通道 · 异步监督', '#8e44ad', false),
-    h(Copier, { text, label: '复制复审意见开场白' }),
+    chip(`复审 · ${stateLabel}（意见 ${String(review?.count ?? 0)} 条）`, inProgress ? stateColor : palette.dim, inProgress),
+    h('span', { style: { color: palette.dim } }, actionText),
   )
 }
 
@@ -389,7 +428,7 @@ function MeetingCard(props: {
     h('div', { style: { color: palette.dim, fontSize: 12, margin: '4px 0 2px' } }, `议题：${meeting.topic}`),
     h(StageNow, { meeting }),
     h(SupervisionWindow, { meeting, records, tallies }),
-    h(ReviewEntry, { meeting }),
+    h(ReviewPanel, { meeting }),
     // 阶段进度条
     h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 2, marginBottom: 8 } },
       ...meeting.stages.map(stage => chip(

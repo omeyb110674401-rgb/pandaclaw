@@ -33,6 +33,8 @@ export type RecordKind =
   | 'rebind'
   | 'warning'
   | 'supervision'
+  | 'review'
+  | 'review-reply'
 
 /** 席位：协商方 / 审查方 / 主持人. */
 export type Seat = 'cppcc' | 'npc' | 'chair'
@@ -313,3 +315,67 @@ export function hasOpinionStructure(text: string): boolean {
   const hasProposal = /(建议|应当|采用|推行|设立|增加|减少|取消|改为)/.test(text)
   return hasBasis && hasProposal
 }
+
+// —— 复审回告闭环（ADR-0010）——
+
+/** 复审子状态：已归档案卷上跑的六阶段状态机（不占 `status`，原卷保持归档）. */
+export type ReviewState =
+  | 'idle'          // 未进入复审（默认）
+  | 'filed'         // ① 登记：review 记录已落板，等待受理
+  | 'accepted'      // ② 受理：服务层完成有效性检查
+  | 'reviewing'     // ③ 审查：审查替身已派发，产出审查意见中
+  | 'hearing'       // ④ 沟通纠正：异议方陈述窗口（被动陈述人）
+  | 'decidable'     // ⑤ 决议出口：审查意见已呈用户，等待三选
+  | 'feedback'      // ⑥ 反馈：出口已裁，逐条回告落板中
+  | 'closed'        // 复审完毕（出口落板、回告齐备）
+
+/** 协议标记的「待验证放行」降级态：进入待复审池后应优先出审. */
+export type ReviewFlag =
+  | 'none'               // 无降级标记
+  | 'consultive'         // 征询采信·未达法定状态（ADR-0004）
+  | 'skip-validation'    // 验收 skip 档归档（无验收把关）
+
+/**
+ * 复审类型分层（Q17：「有备必审」按类型效力分层出审）.
+ * 复审审的是「决定对不对」——效力等级决定复审必要性与出审次序：
+ * `main`＝主力（RES/LEG，备案审查直接同构，入池即自动出审）；
+ * `secondary`＝次级（PLA/STR，轮候或用户/专项触发）；
+ * `weak`＝弱（CON，仅用户提意见触发）；
+ * `none`＝不入池（MIN，无新决定，「记」非「决」，异议走会内更正循环）.
+ */
+export const REVIEW_TIERS: Readonly<Record<MeetingType, 'main' | 'secondary' | 'weak' | 'none'>> = {
+  MIN: 'none',
+  RES: 'main',
+  CON: 'weak',
+  PLA: 'secondary',
+  STR: 'secondary',
+  LEG: 'main',
+}
+
+/**
+ * 复审出审优先级的机械排序依据（服务层零 AI 判断）.
+ * 主力档先于次级/弱档；同档内降级标记优先于无标记.
+ * @param tier - 类型分层（'main' | 'secondary' | 'weak' | 'none'）.
+ * @param flag - 协议降级标记.
+ */
+export function reviewPriority(tier: 'main' | 'secondary' | 'weak' | 'none', flag: ReviewFlag): number {
+  const tierBase = tier === 'main' ? 0 : tier === 'secondary' ? 10 : 20
+  const flagBonus = flag === 'none' ? 0 : 1
+  return tierBase + flagBonus
+}
+
+/** 复审六阶段标签（ADR-0010 第 2 节，与监督法 §38-45 逐段同构）. */
+export const REVIEW_FLOW: readonly { readonly id: ReviewState; readonly label: string }[] = [
+  { id: 'filed', label: '登记' },
+  { id: 'accepted', label: '受理' },
+  { id: 'reviewing', label: '审查' },
+  { id: 'hearing', label: '沟通纠正' },
+  { id: 'decidable', label: '决议出口' },
+  { id: 'feedback', label: '反馈回告' },
+]
+
+/** 复审意见的条数上限（逐条回告义务的机械边界；超限的后续意见并入前条处置）. */
+export const MAX_REVIEW_PER_DOC = 10
+
+/** 复审审查意见的字数上限（审查替身产出，代码硬编码的 setup 规约）. */
+export const REVIEW_OPINION_LIMIT = 600

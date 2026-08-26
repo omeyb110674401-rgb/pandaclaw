@@ -26,6 +26,13 @@ export type PcErrorCode =
   | 'ADJOURN_BLOCKED'
   | 'WARNING_REQUIRED'
   | 'SUPERVISION_PENDING'
+  // 复审回告闭环（ADR-0010）
+  | 'REVIEW_UNAVAILABLE'       // 该类型不进复审（MIN）/ 未归档
+  | 'REVIEW_STAGE_BLOCKED'     // 复审状态机不允许当前动作
+  | 'REVIEW_EXHAUSTED'         // 复审意见条数超限
+  | 'REVIEW_CHOICE_INVALID'    // 出口三选值非法
+  | 'REVIEW_ALREADY_CLOSED'    // 复审已闭环
+  | 'REVIEW_REPLY_PENDING'     // 回告未齐备（feedback 阶段逐条回执未完）
 
 /** 携带协议错误码与模型可读理由的异常. */
 export class PcError extends Error {
