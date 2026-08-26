@@ -6,7 +6,7 @@
  * CSS 管线.
  */
 
-import { createElement as h } from 'react'
+import { createElement as h, useState } from 'react'
 import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
 import type { PcMeetingBoard, PcMeetingView, PcRecordView, PcTallyView } from '../contract.ts'
 
@@ -38,6 +38,69 @@ const TYPE_LABELS: Record<string, string> = {
 }
 
 const STATUS_LABELS: Record<string, string> = { open: '进行中', adjourned: '已归档', terminated: '已终止' }
+
+/** 空态快速开始模板：处境 → 开场白文案（与 SKILL §0 使用地图的推荐一一对应）. */
+const QUICKSTART_TEMPLATES: ReadonlyArray<{
+  readonly label: string
+  readonly hint: string
+  readonly text: string
+}> = [
+  {
+    label: '协商型 · 重大议题',
+    hint: '多轮质询答辩，关键阶段请你裁定',
+    text: '开个协商型会议：议题＝（一句话议题）；成功标准＝（可验收的结果）；验收档 key。',
+  },
+  {
+    label: '纪要型 · 例会留痕',
+    hint: '几乎不打扰，自动确证归档',
+    text: '开个纪要型例会，记录以下议定事项：\n1. …\n2. …',
+  },
+  {
+    label: '决议型 · 快速拍板',
+    hint: '方案明确，直接表决',
+    text: '开个决议型会议：方案＝（一句话方案）；验收档 skip。',
+  },
+]
+
+/** 单张模板卡：一键复制开场白到剪贴板. */
+function TemplateCard(props: {
+  readonly label: string
+  readonly hint: string
+  readonly text: string
+}): ReturnType<typeof h> {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    // 剪贴板不可用（非安全上下文等）时静默失败，文案仍在卡上可手动照抄.
+    navigator.clipboard?.writeText(props.text)?.then(
+      () => {
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1600)
+      },
+      () => {},
+    )
+  }
+  return h('div', {
+    style: {
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+      background: palette.card, border: `1px solid ${palette.border}`,
+      borderRadius: 10, padding: '10px 12px', marginBottom: 8,
+    },
+  },
+    h('div', {},
+      h('div', { style: { fontSize: 13 } }, props.label),
+      h('div', { style: { fontSize: 11, color: palette.dim, marginTop: 2 } }, props.hint),
+    ),
+    h('button', {
+      onClick: copy,
+      style: {
+        flexShrink: 0, cursor: 'pointer', fontSize: 12,
+        padding: '4px 12px', borderRadius: 8,
+        border: `1px solid ${palette.accent}`, color: copied ? '#fff' : palette.accent,
+        background: copied ? palette.accent : 'transparent',
+      },
+    }, copied ? '已复制' : '复制'),
+  )
+}
 
 const palette = {
   bg: 'transparent',
@@ -148,7 +211,16 @@ export function MeetingStage(props: MeetingStageProps): ReturnType<typeof h> {
     style: { height: '100%', overflowY: 'auto', padding: '14px 16px', boxSizing: 'border-box' },
   },
     board.meetings.length === 0
-      ? h('div', { style: { color: palette.dim, textAlign: 'center', marginTop: 48 } }, '本会话暂无会议')
+      ? h('div', { style: { maxWidth: 460, margin: '36px auto 0' } },
+        h('div', { style: { fontSize: 13, color: palette.dim, marginBottom: 12, lineHeight: 1.6 } },
+          '本会话暂无会议。选一张卡片复制开场白发给助手即可开会；也可以直接说「开个会：〈议题〉」，由助手推荐合适的会议类型。'),
+        ...QUICKSTART_TEMPLATES.map(template => h(TemplateCard, {
+          key: template.label,
+          label: template.label,
+          hint: template.hint,
+          text: template.text,
+        })),
+      )
       : [
         ...open.map(meeting => createElementCard(board, meeting)),
         ...closed.map(meeting => createElementCard(board, meeting)),
