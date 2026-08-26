@@ -1,0 +1,226 @@
+# ==============================================================================
+# PandaClaw 公文渲染层 · GB/T 9704—2012 排版参数表（机器可读）
+# ==============================================================================
+# 对应任务 ：制度调研线 C · P1-5「版式工程化参数表与字体合规」（执行日期 2026-08-26）
+# 数值出处 ：.pandaclaw/docs/research/C-补-P01-GB9704原件核对.md
+#            （C 线 P0-1，W1 已关闭：全文转载逐字通读 ＋ 每值 ≥1 独立来源逐字交叉；
+#            下述每个值的行尾注释均给出 GB/T 9704—2012 条款号）
+# 标准状态 ：GB/T 9704—2012 现行有效（2025-05-30 复审「继续有效」，见核对文件 §一）
+# 配套报告 ：.pandaclaw/docs/research/C-补-P15-版式工程化参数表与字体合规.md
+#
+# ── 单位与换算约定（注释块，均非标准内容）────────────────────────────────────
+# 1. 长度一律 mm，与标准原文一致；CSS 渲染建议直接使用 mm 绝对长度单位。
+#    如需 px：96dpi 下 1 mm = 96/25.4 px ≈ 3.7795275591 px（CSS 绝对长度规范定义）。
+# 2. 中文字号 → pt 对照：二号 ≈ 22pt、三号 ≈ 16pt、四号 ≈ 14pt（备查：小四 ≈ 12pt、
+#    五号 ≈ 10.5pt）。⚠ pt 换算属出版常识，非标准内容——GB/T 9704 只规定中文字号
+#    名称与字体种类，全篇不出现 pt 数值；本表 pt 值仅供 CSS font-size 取值参考。
+# 3. 行距的两条口径在标准内同时成立，实现时二选一并在产物注释声明：
+#    a) 网格口径：版心高 225 mm ÷ 22 行 ≈ 10.227 mm/行（≈ 29.0 pt）——撑满版心用此值；
+#    b) 术语口径：「行＝一个汉字高度加 3 号汉字高度的 7/8 的距离」（3.2），按 16pt 计
+#       ≈ 30 pt/行 ≈ 10.58 mm——用于「空 X 行」等要素间距推算；
+#       两口径存在张力（22 × 30pt = 660pt > 225mm = 637.8pt），渲染器默认取 a)、
+#       要素间距取 b)，demo 与报告 §一 有展开。
+# ==============================================================================
+
+meta:
+  standard: "GB/T 9704-2012 党政机关公文格式"
+  standard_status: current          # 现行有效（2025-05-30 复审继续有效）
+  value_audit: ".pandaclaw/docs/research/C-补-P01-GB9704原件核对.md"
+  companion_report: ".pandaclaw/docs/research/C-补-P15-版式工程化参数表与字体合规.md"
+  length_unit: mm
+  mm_to_px_at_96dpi: 3.7795275591   # = 96/25.4，CSS 规范常识，非标准内容
+
+# ── 纸张与印刷（第 4 章、第 5 章、6.2）───────────────────────────────────────
+page:
+  format: A4
+  width_mm: 210                     # 5.1（引 GB/T 148）：成品 210mm×297mm
+  height_mm: 297                    # 5.1
+  paper_gsm_min: 60                 # 第 4 章：60 g/m²~80 g/m² 胶版印刷纸或复印纸
+  paper_gsm_max: 80                 # 第 4 章
+  printing: duplex                  # 6.2 双面印刷（W4 定性引用，见核对文件 §三）
+
+# ── 页边距（5.2.1）──────────────────────────────────────────────────────────
+margins:
+  top_mm: 37                        # 5.2.1 天头（上白边）37 mm±1 mm
+  top_tolerance_mm: 1               # 5.2.1
+  binding_mm: 28                    # 5.2.1 订口（左白边）28 mm±1 mm（双面印制时偶数页翻转到右侧）
+  binding_tolerance_mm: 1           # 5.2.1
+  right_mm_derived: 26              # 推算值：210 − 28 − 156；标准未单列右白边数值
+  bottom_mm_derived: 35             # 推算值：297 − 37 − 225；标准未单列下白边数值
+
+# ── 版心（5.2.1）────────────────────────────────────────────────────────────
+text_area:
+  width_mm: 156                     # 5.2.1 版心 156 mm×225 mm
+  height_mm: 225                    # 5.2.1
+  text_color: "#000000"             # 5.2.4 公文中的文字颜色均为黑色
+
+# ── 字行网格（3.2、5.2.3）───────────────────────────────────────────────────
+grid:
+  lines_per_page: 22                # 5.2.3 每面排 22 行
+  chars_per_line: 28                # 5.2.3 每行 28 个字，并撑满版心
+  char_unit: one_han_char_width     # 3.2 「字」＝一个汉字宽度
+  line_unit: han_height_plus_7_8_of_3hao_height  # 3.2 「行」的定义（见文件头注第 3 条）
+  line_height_mm_grid: 10.227       # 推算：225/22（口径 a）
+  line_height_pt_term: 30           # 推算：16pt×(1+7/8)（口径 b）
+
+# ── 字体字号基准（5.2.2、7.3.1、7.4、7.5 及版头诸条）────────────────────────
+# 开源替代选型见配套报告 §二（OFL 合规评估）；此处只登记标准的字体种类要求。
+fonts:
+  base:                             # 5.2.2 如无特殊说明，一般用 3 号仿宋体字
+    role: body
+    zh_size: 三号
+    family: fangsong
+    approx_pt: 16                   # 出版常识换算，非标准内容
+  heading:                          # 7.3.1 标题：2 号小标宋体字
+    role: title
+    zh_size: 二号
+    family: xiaobiaosong
+    approx_pt: 22                   # 出版常识换算，非标准内容
+  minor:                            # 7.4.2/7.4.3 版记要素、7.5 页码：4 号
+    role: version_table_and_page_number
+    zh_size: 四号
+    approx_pt: 14                   # 出版常识换算，非标准内容
+  copy_number:                      # 7.2.1 份号：3 号阿拉伯数字
+    zh_size: 三号
+    digits: arabic
+  classification:                   # 7.2.2 密级和保密期限：3 号黑体（★ 写法锚点不在本标准，
+    zh_size: 三号                   #   见《国家秘密文件…标志的规定》第四条，C-补-P04 附录）
+    family: heiti
+  urgency:                          # 7.2.3 紧急程度：3 号黑体
+    zh_size: 三号
+    family: heiti
+  signer_name:                      # 7.2.6 签发人姓名：3 号楷体（「签发人」本身 3 号仿宋）
+    zh_size: 三号
+    family: kaiti
+  heading_levels:                   # 7.3.3 层次序数「一、」「（一）」「1.」「（1）」
+    level1: heiti                   # 第一层 黑体
+    level2: kaiti                   # 第二层 楷体
+    level3: fangsong                # 第三层 仿宋
+    level4: fangsong                # 第四层 仿宋
+  page_number:                      # 7.5 页码：4 号半角宋体阿拉伯数字
+    zh_size: 四号
+    family: songti
+    digits: halfwidth_arabic
+
+# ── 版头/主体关键区域定位（7.2、7.3）───────────────────────────────────────
+regions:
+  org_logo:                         # 7.2.4 发文机关标志
+    color: red                      # 推荐红色
+    family: xiaobiaosong            # 推荐小标宋体
+    align: center                   # 居中排布
+    top_offset_from_text_area_top_mm: 35   # 上边缘至版心上边缘 35 mm
+  filing_number:                    # 7.2.5 发文字号
+    placement: two_blank_lines_below_logo_centered   # 标志下空二行居中
+    year_brackets: hexagonal        # 年份六角括号〔〕、全称
+    ordinal_no_pad_zero: true       # 顺序号不加「第」、不编虚位（1 不写成 01）、数字后加「号」
+  signer:                           # 7.2.6 签发人（上行文）
+    placement: right_blank_one_char_same_line_as_filing_number   # 居右空一字、与最后签发人同行
+  title:                            # 7.3.1 标题
+    placement: two_blank_lines_below_red_rule_centered   # 红线下空二行，居中
+    punctuation_note: convention    # 「标题不加标点」非国标明文，挂通行惯例（C-补-P01 #14 降级修正）
+  addressee:                        # 7.3.2 主送机关
+    placement: one_blank_line_below_title_left_flush    # 标题下空一行居左顶格，末尾全角冒号
+  signature_seal:                   # 7.3.5.1 盖章件（印章下压算法的文字规则）
+    date_right_blank_chars: 4       # 成文日期右空四字
+    org_sign_placement: centered_above_date   # 单一机关署名居中编排在成文日期之上
+    seal_overlap_rule: seal_center_above_both_lines   # 印章端正居中下压，使署名与日期处于印章中心偏下位置
+    seal_top_max_gap: one_blank_line_from_body    # 印章顶端上距正文（或附件说明）一行之内
+    joint_issue: no_overlap_no_tangency_edges_within_text_area   # 联合行文：互不相交相切、两端不超版心
+  unsigned_variant:                 # 7.3.5.2 不盖章件兜底规则（报告漏项已补，C-补-P01 #19）
+    org_right_blank_chars: 2        # 署名右空二字
+    date_first_char_shift: 2        # 日期首字比署名首字右移二字
+    long_date_fallback: date_right_blank_2_chars_widen_org_indent
+    # ↑ 如成文日期长于署名，使日期右空二字并相应增加署名右空字数
+
+# ── 红色分隔线（7.2.7）──────────────────────────────────────────────────────
+red_rule:
+  gap_below_filing_number_mm: 4     # 7.2.7 发文字号之下 4 mm 处
+  width_mm: 156                     # 7.2.7 与版心等宽（156 mm）
+  align: center                     # 7.2.7 居中印一条红色分隔线
+  thickness_mm: null                # 标准未规定线粗——实现取视觉值并在模板注释声明（非标准内容）
+
+# ── 页码（7.5）──────────────────────────────────────────────────────────────
+page_number:
+  gap_rule_to_text_area_bottom_mm: 7   # 7.5 一字线上距版心下边缘 7 mm
+  dash_style: one_char_line_both_sides # 7.5 数字左右各一条一字线
+  odd_pages: right_blank_one_char   # 7.5 单页码居右空一字
+  even_pages: left_blank_one_char   # 7.5 双页码居左空一字
+  numbering_continuous_with_appendix: true   # 7.5 附件与正文一起装订时页码连续
+  suppressed_on:
+    - blank_page_before_version_table_page   # 7.5 版记页前有空白页的空白页不编页码
+    - version_table_page                     # 7.5 版记页不编页码
+    - letter_format_first_page               # 10.1 信函格式首页不显示页码
+  landscape_table:                  # 第 8 章 横排表格页（C-补-P01 #28 补充）
+    same_numbering: true            # 页码与其他页一致
+    header_side_by_parity: odd_binding_even_cut   # 单页码表头在订口一边、双页码表头在切口一边
+
+# ── 版记（7.4）──────────────────────────────────────────────────────────────
+version_table:
+  rule_width: same_as_text_area     # 7.4.1 分隔线与版心等宽
+  first_rule_thickness_mm: 0.35     # 7.4.1 首条粗线推荐高度 0.35 mm（「推荐」＝软约束）
+  last_rule_thickness_mm: 0.35      # 7.4.1 末条粗线推荐高度 0.35 mm
+  middle_rule_thickness_mm: 0.25    # 7.4.1 中间细线推荐高度 0.25 mm
+  first_rule_position: above_first_element              # 7.4.1 首条位于第一个要素之上
+  last_rule_position: coincident_with_last_page_text_area_bottom   # 7.4.1 末条与最后一面版心下边缘重合
+  placement_hard_rule: last_page_only                   # C-补-P01 §三 W4：硬规则＝最后一面
+  even_page_convention: soft_hint   # C-补-P01 §三 W4：偶数页＝装订惯例，实现为软提示（打印补白页）
+  cc_organs:                        # 7.4.2 抄送机关
+    zh_size_four_fangsong: true     # 4 号仿宋
+    indent_chars_each_side: 1       # 左右各空一字
+    wrap_align: after_colon_first_char   # 回行与冒号后首字对齐，最后名称后标句号
+    promoted_zhusong_header: zhusong_above_cc_no_divider # 主送移版记改「主送」，置抄送上一行、之间不加分隔线
+  printer_and_date:                 # 7.4.3 印发机关和印发日期
+    zh_size_four_fangsong: true     # 4 号仿宋
+    printer_left_blank_chars: 1     # 印发机关左空一字
+    date_right_blank_chars: 1       # 印发日期右空一字
+    suffix: yinfa                   # 「印发」二字结尾
+    extra_thin_rule_above: true     # 版记其他要素与其之间用一条细分隔线隔开（C-补-P01 #26 补充）
+
+# ── 三种特定格式变体（第 10 章）─────────────────────────────────────────────
+special_formats:
+  letter:                           # 10.1 信函格式
+    logo_text: fullname_or_normalized_shortname_without_wenjian   # 全称或规范化简称，不带「文件」
+    logo_color: red                 # 推荐红色小标宋
+    logo_top_offset_from_page_top_mm: 30   # 标志上边缘至上页边 30 mm
+    upper_double_line:              # 标志下 4 mm 红色双线
+      gap_below_logo_mm: 4
+      style: thick_over_thin        # 上粗下细
+    lower_double_line:              # 距下页边 20 mm 红色双线
+      gap_from_page_bottom_mm: 20
+      style: thin_over_thick        # 上细下粗
+    double_line_length_mm: 170      # 两线长均为 170 mm，居中（注意：长于版心 156 mm，需越出内容盒）
+    filing_number_placement: right_flush_below_first_double_line   # 顶格居版心右边缘第一条红双线下
+    element_gap_unit: 7_8_of_3hao_height   # 各要素与双线距离＝3 号汉字高度 7/8（10.1 通篇口径）
+    page_number_first_page: none    # 首页不显示页码
+    version_table_variant: no_printer_no_date_no_middle_rules_at_last_page_text_area_bottom
+    # ↑ 版记不加印发机关和印发日期、不分隔线，位于最后一面版心内最下方
+  command:                          # 10.2 命令（令）格式
+    logo_text: fullname_plus_mingling_or_ling   # 全称＋「命令」或「令」
+    logo_color: red                 # 推荐红色小标宋
+    logo_top_offset_from_text_area_top_mm: 20   # 标志上边缘至版心上边缘 20 mm
+    command_number_placement: two_blank_lines_below_logo_centered   # 标志下空二行居中编排令号
+    body_placement: two_blank_lines_below_command_number   # 令号下空二行编排正文
+    signature_channel: per_clause_7_3_5_3   # 签发人职务、签名章和成文日期见 7.3.5.3（签名章代公章）
+  minutes:                          # 10.3 纪要格式
+    logo_text: xxx_jiyao            # 「XXXXX纪要」居中，推荐红色小标宋
+    logo_top_offset_from_text_area_top_mm: 35   # 标志上边缘至版心上边缘 35 mm
+    has_filing_number: false        # 无发文字号要素
+    has_signature: false            # 无署名要素
+    has_date: false                 # 无成文日期要素
+    has_seal: false                 # 无印章要素（体例推定＋《应用指南》明文释义，见 C-补-P05）
+    attendee_list:                  # 出席名单编排
+      trigger: one_blank_line_below_body_or_attachment_note   # 正文（或附件说明）下空一行
+      label: hei_ti_label_plus_fullwidth_colon   # 左空二字 3 号黑体「出席」＋全角冒号
+      names: san_hao_fangsong_wrap_align_after_colon   # 冒号后 3 号仿宋，回行与冒号后首字对齐
+      other_rows: qingjia_luexi_replace_label   # 请假/列席另起一行替换二字
+    flexibility: may_adapt_to_reality   # 10.3 明文「纪要格式可以根据实际制定」
+
+# ── 附：标准援引的三项技术国标（第 9 章，整章仅此一句）──────────────────────
+normative_references:               # 详见 C-补-P02（P0-2 产物）
+  units: GB 3100/3101/3102          # 计量单位
+  punctuation: GB/T 15834           # 标点符号
+  numerals: GB/T 15835              # 数字用法
+
+# ── 附：开源字体映射（指针，选型依据见配套报告 §二）─────────────────────────
+# 本表不内置字体文件名；渲染器落地时的 OFL 字体映射（朱雀仿宋/思源宋体等）
+# 以 C-补-P15 报告的评估结论为准，部署时须将对应 LICENSE 文件随分发留存。

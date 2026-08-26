@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<!-- ============================================================================
+  C-补-P15 · GB/T 9704—2012 红头公文版式 print CSS 原型（自包含 demo）
+  ----------------------------------------------------------------------------
+  对应任务 ：PandaClaw 制度调研线 C · P1-5（执行日期 2026-08-26）
+  参数出处 ：全部数值取自 .pandaclaw/docs/research/C-补-P01-GB9704原件核对.md
+            （C 线 P0-1 逐值核对，W1 已关闭）；机器可读参数表见
+            .pandaclaw/templates/layout-gbt9704.yaml；合规结论见
+            .pandaclaw/docs/research/C-补-P15-版式工程化参数表与字体合规.md
+  演示范围 ：①@page A4 与 37mm/28mm 页边距　②红色发文机关标志＋发文字号＋
+            4mm 红色分隔线定位　③印章下压署名与成文日期的位置算法（7.3.5.1）
+            ④骑缝章的一页内示意实现　⑤信函格式红双线变体（10.1）
+  字体说明 ：demo 不引入任何字体文件，仅用系统字体 fallback；生产环境按
+            C-补-P15 §二 的 OFL 开源字体评估结论替换。
+  已知限制 ：印章环文用内联 SVG textPath 绘制（演示用途，非电子签章）；
+            骑缝章为一页内示意，真实跨页需每页按同一几何锚点渲染半章。
+============================================================================ -->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>C-补-P15 · GB/T 9704 红头公文版式原型</title>
+<style>
+  /* ---------- 设计令牌（数值出处见各注释条款号） ---------- */
+  :root {
+    /* 页面几何：5.1 幅面 210×297；5.2.1 天头 37、订口 28、版心 156×225 */
+    --page-w: 210mm;
+    --page-h: 297mm;
+    --margin-top: 37mm;      /* 5.2.1 天头 */
+    --margin-binding: 28mm;  /* 5.2.1 订口（左白边） */
+    --margin-right-derived: 26mm;   /* 推算：210−28−156，标准未单列 */
+    --margin-bottom-derived: 35mm;  /* 推算：297−37−225，标准未单列 */
+    --area-w: 156mm;         /* 5.2.1 版心宽 */
+    --area-h: 225mm;         /* 5.2.1 版心高 */
+
+    /* 行距口径 a（网格）：225mm ÷ 22 行 ≈ 10.23mm/行（≈29pt），撑满版心用 */
+    --line-grid: 10.23mm;
+    /* 行距口径 b（术语 3.2「行」的定义）：16pt×1.875 ≈ 10.58mm，「空 X 行」间距用 */
+    --line-term: 10.58mm;
+
+    /* 字号（pt 对照属出版常识非标准内容）：三号≈16pt 二号≈22pt 四号≈14pt */
+    --fs-base: 16pt;         /* 5.2.2 三号仿宋 */
+    --fs-title: 22pt;        /* 7.3.1 二号小标宋 */
+    --fs-minor: 14pt;        /* 7.4/7.5 四号 */
+
+    /* 系统字体 fallback（demo 不引入字体文件；生产按 C-补-P15 §二 OFL 结论替换） */
+    --font-fangsong: "FZFangSong-Z02S", "方正仿宋_GBK", "仿宋_GB2312", "STFangsong", "FangSong", "仿宋", serif;
+    --font-xiaobiaosong: "FZXiaoBiaoSong-B05S", "方正小标宋简体", "STZhongsong", "华文中宋", "SimSun", "宋体", serif;
+    --font-song: "SimSun", "宋体", "Noto Serif CJK SC", serif;
+    --font-heiti: "SimHei", "黑体", "Noto Sans CJK SC", sans-serif;
+    --font-kaiti: "KaiTi", "楷体", "STKaiti", serif;
+
+    --red: #d0021b;          /* 标准仅要求「红色」，色值为实现视觉值（非标准内容） */
+    --ink: #000;             /* 5.2.4 文字颜色均为黑色 */
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #525659;
+    font-family: var(--font-fangsong);
+    color: var(--ink);
+    padding: 56px 0 80px;
+  }
+
+  /* ---------- 工具条（屏幕专用） ---------- */
+  .toolbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 99;
+    background: #1e1f22; color: #eee;
+    display: flex; gap: 12px; align-items: center;
+    padding: 10px 16px; font-size: 13px; font-family: system-ui, sans-serif;
+  }
+  .toolbar button {
+    cursor: pointer; border: 1px solid #666; border-radius: 4px;
+    background: #33363b; color: #eee; padding: 5px 12px; font-size: 13px;
+  }
+  .toolbar button:hover { background: #4a4e55; }
+  #seal-readout { font-family: Consolas, monospace; color: #9fe3a1; white-space: pre; }
+
+  /* 说明横幅（屏幕专用） */
+  .brief {
+    max-width: 210mm; margin: 0 auto 24px; padding: 14px 18px;
+    background: #fff8e6; border: 1px solid #e0c97f; border-radius: 6px;
+    font: 13px/1.7 system-ui, sans-serif; color: #444;
+  }
+  .brief b { color: #8a6d00; }
+  .brief code { background: #f2ead2; padding: 0 4px; border-radius: 3px; }
+
+  /* ---------- 纸张模型 ----------
+     屏幕：固定 210×297 白纸，内边距即页边距，内容盒＝版心；
+     打印：交给 @page，纸张盒退化为普通分页块。 */
+  .sheet {
+    position: relative;
+    width: var(--page-w); height: var(--page-h);
+    margin: 0 auto 28px;
+    padding: var(--margin-top) var(--margin-right-derived) var(--margin-bottom-derived) var(--margin-binding);
+    background: #fff;
+    box-shadow: 0 2px 14px rgba(0,0,0,.45);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .sheet-main { flex: 1 1 auto; display: flex; flex-direction: column; }
+
+  /* ---------- 测量辅助线（屏幕专用，可切换） ---------- */
+  .sheet.guides::before {
+    content: ""; position: absolute;
+    inset: var(--margin-top) var(--margin-right-derived) var(--margin-bottom-derived) var(--margin-binding);
+    outline: 1px dashed #00a0e0; pointer-events: none;
+  }
+  .sheet.guides::after {
+    content: "虚线框＝版心 156×225mm（5.2.1）｜天头 37mm｜订口 28mm";
+    position: absolute; left: var(--margin-binding); top: 4mm;
+    font: 10px/1.4 Consolas, monospace; color: #0077aa; pointer-events: none;
+  }
+
+  /* ---------- 正文排版基线 ---------- */
+  .body-text p {
+    font-size: var(--fs-base);
+    line-height: var(--line-grid);      /* 口径 a：22 行网格 */
+    text-align: justify;
+    text-indent: 2em;                   /* 7.3.3 段左空二字 */
+  }
+  .lv1 { font-family: var(--font-heiti); }   /* 7.3.3 第一层 黑体 */
+  .lv2 { font-family: var(--font-kaiti); }   /* 第二层 楷体 */
+
+  /* ---------- 版头：标志 / 发文字号 / 红色分隔线 ---------- */
+  .org-logo {
+    margin-top: 35mm;                   /* 7.2.4 上边缘至版心上边缘 35mm */
+    text-align: center;
+    font-family: var(--font-xiaobiaosong);
+    font-weight: 700;
+    font-size: 34pt;                    /* 标志字号无明文，34pt 为演示视觉值 */
+    color: var(--red);
+    letter-spacing: .06em;
+    line-height: 1.15;
+  }
+  .filing-number {
+    margin-top: calc(var(--line-term) * 2);   /* 7.2.5 标志下空二行 */
+    text-align: center;                 /* 7.2.5 居中 */
+    font-size: var(--fs-base);
+    line-height: 1.4;
+  }
+  /* 示意例构造符合 7.2.5：六角括号年份全称＋序号不编虚位＋数字后加「号」（C-补-P01 §四） */
+  .red-rule {
+    margin-top: 4mm;                    /* 7.2.7 发文字号之下 4mm */
+    height: .7mm;                       /* 线粗无明文——演示视觉值（见 YAML 注释） */
+    background: var(--red);
+    width: 100%;                        /* 7.2.7 与版心等宽 156mm＝内容盒满宽 */
+  }
+
+  /* ---------- 标题 / 主送 ---------- */
+  .doc-title {
+    margin-top: calc(var(--line-term) * 2);   /* 7.3.1 红线下空二行 */
+    text-align: center;
+    font-family: var(--font-xiaobiaosong);
+    font-size: var(--fs-title);         /* 7.3.1 二号小标宋 */
+    font-weight: 700;
+    line-height: 1.5;
+  }
+  .addressee {
+    margin-top: var(--line-term);       /* 7.3.2 标题下空一行 */
+    font-size: var(--fs-base);
+    line-height: var(--line-grid);
+  }
+
+  /* ---------- 生效标识区：署名＋成文日期＋印章（7.3.5.1） ---------- */
+  .sign-block {
+    position: relative;                 /* 印章的定位容器 */
+    margin-top: var(--line-term);       /* 紧随正文之下（7.3.5.1 印章顶端须距正文一行之内，
+                                           生效区不能远离正文沉底）；剩余留白自然落在页底 */
+    padding-bottom: 2mm;
+  }
+  .org-sign {
+    display: block; text-align: center; /* 7.3.5.1 署名居中编排于成文日期之上 */
+    font-size: var(--fs-base); line-height: var(--line-term);
+  }
+  .date-line {
+    display: block; text-align: right;
+    padding-right: 4em;                 /* 7.3.5.1 成文日期右空四字 */
+    font-size: var(--fs-base); line-height: var(--line-term);
+  }
+  .seal-wrap {
+    position: absolute; width: 45mm; height: 45mm;  /* 直径 45mm：国发〔1999〕25 号规格梯度，
+                                                       PC 映射默认值见 C-补-P04 §四 */
+    pointer-events: none;
+    mix-blend-mode: multiply;           /* 印文叠加在文字上，文字透显 */
+  }
+  .seal-wrap svg { width: 100%; height: 100%; transform: rotate(-4deg); }
+
+  /* ---------- 页码（7.5） ---------- */
+  .pagenum {
+    position: absolute;
+    top: calc(var(--margin-top) + var(--area-h) + 7mm);  /* 一字线上距版心下边缘 7mm */
+    font-family: var(--font-song);
+    font-size: var(--fs-minor);         /* 4 号半角宋体阿拉伯数字 */
+  }
+  .pagenum i { font-style: normal; padding: 0 .35em; }  /* 数字左右各一条一字线 */
+  .pagenum.odd  { right: calc(var(--margin-right-derived) + 5mm); }  /* 单页码居右空一字 */
+  .pagenum.even { left:  calc(var(--margin-binding)       + 5mm); }  /* 双页码居左空一字 */
+
+  /* ---------- 版记（7.4） ---------- */
+  .version-table { margin-top: auto; }  /* 7.4.1 位于最后一面版心下部 */
+  .vt-rule-thick { border: 0; border-top: .35mm solid var(--ink); }   /* 7.4.1 粗线推荐 0.35mm */
+  .vt-rule-thin  { border: 0; border-top: .25mm solid var(--ink); }   /* 7.4.1 细线推荐 0.25mm */
+  .vt-row {
+    display: flex; justify-content: space-between;
+    font-size: var(--fs-minor);         /* 7.4.2/7.4.3 四号仿宋 */
+    line-height: 1.7;
+    padding: .6mm 1em;                  /* 抄送左右各空一字；印发机关左空一字/日期右空一字由两端对齐体现 */
+  }
+  /* 末条粗线与公文最后一面版心下边缘重合（7.4.1）＝内容盒最后一条边线 */
+
+  /* ---------- 骑缝章示意（一页内模拟两页拼缝） ---------- */
+  .qi-feng-demo { max-width: 210mm; margin: 40px auto; font-family: system-ui, sans-serif; }
+  .qi-feng-demo h3 { color: #eee; margin: 0 0 10px; font-size: 15px; }
+  .qf-stage {
+    position: relative; height: 96mm;
+    display: flex; justify-content: center;
+    background: #6b6f75; border-radius: 4px; padding: 6mm 0;
+  }
+  .qf-page {
+    position: relative; width: 62mm; height: 84mm;
+    background: #fdfdfb; border: 1px solid #cfcfc8;
+    overflow: visible;
+  }
+  .qf-page.left  { border-right: none; }
+  .qf-page.right { border-left: none; }
+  .qf-fakelines { padding: 6mm 5mm; }
+  .qf-fakelines span {
+    display: block; height: 2px; background: #d8d8d0; margin-bottom: 3.2mm;
+  }
+  .qf-seam {
+    position: absolute; left: 50%; top: 6mm; bottom: 6mm;
+    border-left: 1px dashed #b33; z-index: 3;
+  }
+  .qf-seam-label {
+    position: absolute; left: 50%; bottom: -7mm; transform: translateX(-50%);
+    font-size: 11px; color: #ffd7d7; white-space: nowrap;
+  }
+  /* 半章：同一几何的两份拷贝，各自只显示一半，拼缝处互补复原整章 */
+  .qf-half {
+    position: absolute; width: 42mm; height: 42mm; top: 16mm;
+    mix-blend-mode: multiply; pointer-events: none;
+  }
+  .qf-half.a { right: -21mm; clip-path: inset(0 50% 0 0); }   /* 左半章贴在第 N 页右缘 */
+  .qf-half.b { left:  -21mm; clip-path: inset(0 0 0 50%); }   /* 右半章贴在第 N+1 页左缘 */
+  .qf-caption { color: #ddd; font-size: 12px; line-height: 1.8; margin-top: 14mm; }
+
+  /* ---------- 信函格式变体（10.1） ---------- */
+  .sheet.letter { padding-top: 30mm; }  /* 10.1 标志上边缘至上页边 30mm（注意不是版心上边缘） */
+  .letter-logo {
+    text-align: center;
+    font-family: var(--font-xiaobiaosong);
+    font-weight: 700; font-size: 30pt;
+    color: var(--red);                  /* 10.1 推荐红色小标宋；全称不带「文件」二字 */
+    letter-spacing: .05em;
+  }
+  .double-line-upper {
+    margin: 4mm 0 0 -7mm;               /* 标志下 4mm（10.1）；越出内容盒居中：170mm＝(156−170)/2 */
+    width: 170mm; height: 1mm;          /* 10.1 双线长均为 170mm，居中 */
+    border-top: .55mm solid var(--red);     /* 上粗 */
+    border-bottom: .22mm solid var(--red);  /* 下细 —— 10.1 上粗下细 */
+  }
+  .letter-filing-number {
+    text-align: right;                  /* 10.1 发文字号顶格居版心右边缘第一条红双线下 */
+    margin-top: 4.9mm;                  /* 与双线距离＝3 号汉字高度 7/8 ≈ 16pt×0.875 ≈ 4.9mm */
+    font-size: var(--fs-base);
+  }
+  .double-line-lower {
+    position: absolute;
+    bottom: 20mm;                       /* 10.1 距下页边 20mm */
+    left: 50%; transform: translateX(-50%);
+    width: 170mm; height: 1mm;
+    border-top: .22mm solid var(--red);     /* 上细 */
+    border-bottom: .55mm solid var(--red);  /* 下粗 —— 10.1 上细下粗 */
+  }
+  .letter-no-pagenum {
+    position: absolute; bottom: 8mm; left: 0; right: 0;
+    text-align: center; font: 10px Consolas, monospace; color: #999;
+  }
+
+  /* ---------- 打印输出 ---------- */
+  @media print {
+    @page { size: A4; margin: 37mm 26mm 35mm 28mm; }  /* 5.2.1：天头/订口；余两边为推算值 */
+    body { background: #fff; padding: 0; }
+    .no-print { display: none !important; }
+    .sheet {
+      width: auto; height: auto; min-height: 0;
+      margin: 0; padding: 0;
+      box-shadow: none; overflow: visible;
+      page-break-after: always;
+    }
+    .sheet:last-of-type { page-break-after: auto; }
+    /* 打印坐标系以页面区域（版心）为原点：纸面绝对位置整体上移一个天头 */
+    .pagenum { top: calc(var(--area-h) + 7mm); }
+    .sheet.letter .double-line-lower { bottom: -15mm; }  /* 35−20：页面区域底比纸底高 35mm */
+    .sheet.guides::before, .sheet.guides::after { display: none; }
+  }
+
+  /* 辅助线模式下关键点的标注气泡（屏幕专用微交互，纯 CSS） */
+  .guides .org-logo { outline: 1px dotted #e08000; }
+  .guides .red-rule { outline: 1px dotted #e08000; }
+</style>
+</head>
+<body>
+
+<!-- 内联印章图元：SVG textPath 环行机关名称＋五角星（国发〔1999〕25 号式样要素的示意） -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="pandaclaw-seal">
+      <circle cx="100" cy="100" r="95" fill="none" stroke="#c81a1f" stroke-width="6"/>
+      <path id="seal-arc" d="M 22,108 A 78,78 0 1 1 178,108" fill="none"/>
+      <text font-family="'SimSun','宋体',serif" font-size="25" font-weight="700"
+            fill="#c81a1f" letter-spacing="2">
+        <textPath href="#seal-arc" startOffset="50%" text-anchor="middle">熊猫爪管理委员会</textPath>
+      </text>
+      <!-- 五角星（外接圆 R=32，中心 100,112） -->
+      <polygon fill="#c81a1f" points="
+        100,80 106.9,99.2 127.3,99.8 111.2,112.0 117.0,131.6
+        100,120.0 83.0,131.6 88.8,112.0 72.7,99.8 93.1,99.2"/>
+    </g>
+  </defs>
+</svg>
+
+<div class="toolbar no-print">
+  <button onclick="document.body.classList.toggle('show-brief')">说明</button>
+  <button onclick="toggleGuides()">切换测量辅助线</button>
+  <button onclick="window.print()">打印 / 导出 PDF</button>
+  <span id="seal-readout">印章算法读数：待计算…</span>
+</div>
+
+<div class="brief no-print">
+  <b>本页是什么：</b>PandaClaw 公文渲染管线的 print CSS 可行性原型（C 线 P1-5 任务③）。
+  所有几何数值出自 <code>C-补-P01-GB9704原件核对.md</code>（P0-1 逐值核对），机器可读版见
+  <code>.pandaclaw/templates/layout-gbt9704.yaml</code>。含四个板块：
+  ①标准红头首页（标志 35mm／红线 4mm／印章下压算法）②末页版记（0.35/0.25mm 分隔线＋页码一字线 7mm）
+  ③骑缝章一页内示意 ④信函格式红双线变体（30mm／170mm／20mm）。字体为系统 fallback，
+  生产替换方案见报告 §二。<b>请用浏览器「打印→另存为 PDF」验证 @page 输出。</b>
+</div>
+
+<!-- ================= 板块①：标准红头首页 ================= -->
+<section class="sheet" id="page1">
+  <div class="sheet-main">
+
+    <!-- 份号/密级/紧急程度：顶格版心左上角第一至三行（7.2.1–7.2.3），演示占位 -->
+    <div style="position:absolute; top:var(--margin-top); left:var(--margin-binding);
+                font-size:var(--fs-base); line-height:var(--line-grid);">
+      <div>000001</div>
+      <div style="font-family:var(--font-heiti)">秘密★1年</div>
+      <div style="font-family:var(--font-heiti)">特急</div>
+    </div>
+
+    <div class="body-text">
+      <div class="org-logo">熊猫爪管理委员会文件</div>   <!-- 7.2.4：距版心上边缘 35mm，红色小标宋 -->
+      <div class="filing-number">爪委发〔2026〕5 号</div><!-- 7.2.5：标志下空二行居中 -->
+      <div class="red-rule"></div>                        <!-- 7.2.7：字号下 4mm，与版心等宽 -->
+
+      <h1 class="doc-title">关于加强协商成果转化落实工作的意见</h1> <!-- 7.3.1 -->
+      <p class="addressee">各分委会、各专门小组：</p>     <!-- 7.3.2：标题下空一行，左顶格 -->
+
+      <!-- 正文按首页剩余版心预算裁剪至 5 行，保证生效标识区同屏可见；
+           完整四层序数（一、／（一）／1.／（1））的字族映射见 layout-gbt9704.yaml fonts.heading_levels -->
+      <div class="body-text">
+        <p>为把协商成果转化为治理效能，现提出如下意见。</p>
+        <p class="lv1">一、健全成果清单制度</p>
+        <p>全体会议闭会后五个工作日内形成议定事项清单，逐项明确责任主体与完成时限，办结一项、销号一项。</p>
+        <p class="lv2">（一）办理结果在下一轮全体会议上通报。</p>
+      </div>
+
+      <!-- 生效标识区（7.3.5.1）：印章下压署名与成文日期，二者处于印章中心偏下 -->
+      <div class="sign-block" id="sign-block">
+        <span class="org-sign" id="org-sign">熊猫爪管理委员会</span>
+        <span class="date-line" id="date-line">2026年8月26日</span>
+        <span class="seal-wrap" id="seal-main">
+          <svg viewBox="0 0 200 200"><use href="#pandaclaw-seal"/></svg>
+        </span>
+      </div>
+    </div>
+  </div>
+  <div class="pagenum odd"><i>—</i>1<i>—</i></div>       <!-- 7.5：单页码居右空一字 -->
+</section>
+
+<!-- ================= 板块②：末页·版记＋页码 ================= -->
+<section class="sheet" id="page2">
+  <div class="sheet-main">
+    <div class="body-text">
+      <p>本意见自印发之日起施行。此前规定与本意见不一致的，按照本意见执行。各地结合实际制定具体落实措施，重大情况及时报告。</p>
+      <p>附注：本文所涉表格样式另行印发。（演示正文收尾于末页上部，版记沉底。）</p>
+    </div>
+
+    <!-- 版记（7.4）：首条粗线在上，末条粗线与版心下边缘重合 -->
+    <div class="version-table">
+      <hr class="vt-rule-thick">
+      <div class="vt-row"><span>主送：各分委会、各专门小组</span><span></span></div> <!-- 7.4.2 主送移版记改「主送」 -->
+      <div class="vt-row"><span>抄送：市档案馆。</span><span></span></div>           <!-- 回行对齐/句号细则见 YAML -->
+      <hr class="vt-rule-thin">
+      <div class="vt-row"><span>熊猫爪管理委员会办公室</span><span>2026年8月26日印发</span></div> <!-- 7.4.3 -->
+      <hr class="vt-rule-thick">                                    <!-- 7.4.1 末条与版心下边缘重合 -->
+    </div>
+  </div>
+  <div class="pagenum even"><i>—</i>2<i>—</i></div>       <!-- 7.5：双页码居左空一字 -->
+</section>
+
+<!-- ================= 板块③：骑缝章一页内示意 ================= -->
+<div class="qi-feng-demo no-print">
+  <h3>骑缝章效果 · 一页内示意实现（真实跨页＝每页按同一几何锚点渲染半章）</h3>
+  <div class="qf-stage">
+    <div class="qf-page left">
+      <div class="qf-fakelines">
+        <span style="width:86%"></span><span style="width:92%"></span><span style="width:78%"></span>
+        <span style="width:90%"></span><span style="width:84%"></span><span style="width:60%"></span>
+      </div>
+      <svg class="qf-half a" viewBox="0 0 200 200"><use href="#pandaclaw-seal"/></svg>
+    </div>
+    <div class="qf-page right">
+      <div class="qf-fakelines">
+        <span style="width:88%"></span><span style="width:72%"></span><span style="width:94%"></span>
+        <span style="width:82%"></span><span style="width:90%"></span><span style="width:52%"></span>
+      </div>
+      <svg class="qf-half b" viewBox="0 0 200 200"><use href="#pandaclaw-seal"/></svg>
+    </div>
+    <div class="qf-seam"></div>
+    <div class="qf-seam-label">▲ 页缝（装订线）：左半章压第 N 页右缘，右半章压第 N+1 页左缘</div>
+  </div>
+  <p class="qf-caption">
+    实现要点：两份 &lt;use&gt; 引用同一印章图元，尺寸（42mm）、纵向坐标（top:16mm）完全一致；
+    仅以 <code>clip-path: inset()</code> 各取一半，并分别锚定在相邻两页的拼缝两侧。
+    迁移到真实分页时，把「半章」改为每页页脚层的绝对定位元素（以页边缘为锚），几何参数不变。
+  </p>
+</div>
+
+<!-- ================= 板块④：信函格式变体（10.1） ================= -->
+<section class="sheet letter" id="page-letter">
+  <div class="sheet-main">
+    <div class="letter-logo">熊猫爪管理委员会</div>       <!-- 10.1：全称不带「文件」，距上页边 30mm -->
+    <div class="double-line-upper"></div>                 <!-- 10.1：标志下 4mm，长 170mm，上粗下细 -->
+    <div class="letter-filing-number">爪委函〔2026〕12 号</div> <!-- 10.1：顶格居版心右缘、第一条红双线下 -->
+    <div class="body-text" style="margin-top:8mm">
+      <p>贵会关于联合开展协商议题调研的来函收悉。经研究，同意将会期定为九月第二周，并商请贵会牵头拟定调研提纲。</p>
+      <p>专此函复。（信函格式为平行文变体：首页不编页码，版记不加印发机关和印发日期、不分隔线。）</p>
+    </div>
+  </div>
+  <div class="double-line-lower"></div>                   <!-- 10.1：距下页边 20mm，上细下粗 -->
+  <div class="letter-no-pagenum">［信函格式首页不显示页码——GB/T 9704—2012 第 10.1 条］</div>
+</section>
+
+<script>
+  /* ------------------------------------------------------------------
+   * 印章下压位置算法（文字规则出处：7.3.5.1，C-补-P01 #18）
+   *  规则一：印章端正、居中下压署名与成文日期，使二者处于「印章中心偏下」
+   *          ——实现：印章中心 y ＝ 署名日期块顶部 + 块高 × 0.45（略高于块中心）。
+   *  规则二：印章顶端上距正文（或附件说明）「一行之内」
+   *          ——实现：钳制 sealTop ∈ [正文末行底, 正文末行底 + 一行(10.58mm)]。
+   *  规则三：水平居中对准署名轴（单一机关场景署名居中，印章随之居中）。
+   * 读数面板实时输出换算后的毫米值，便于与标准逐条对照。
+   * ------------------------------------------------------------------ */
+  function placeSeal() {
+    const MM = 96 / 25.4;                       /* mm→CSS px（96dpi） */
+    const LINE_TERM_MM = 10.58;                 /* 口径 b：一行（3.2 术语定义） */
+    const block = document.getElementById('sign-block');
+    const bodyLast = block.previousElementSibling || block.parentNode.lastElementChild;
+    const seal = document.getElementById('seal-main');
+    const sign = document.getElementById('org-sign');
+
+    const bRect = block.getBoundingClientRect();
+    const sRect = sign.getBoundingClientRect();
+    const prevRect = bodyLast.getBoundingClientRect();
+    const D = parseFloat(getComputedStyle(seal).width);   /* 45mm 的像素值 */
+
+    /* 规则一：块顶 + 45% 块高 */
+    let centerY = bRect.top + bRect.height * 0.45;
+    /* 规则二：钳制到「正文末行底 ~ +一行」窗口 */
+    const bodyBottom = prevRect.bottom;           /* 正文末元素底沿 */
+    let sealTop = centerY - D / 2;
+    const lo = bodyBottom;                        /* 章顶不得高于正文末行底 */
+    const hi = bodyBottom + LINE_TERM_MM * MM;    /* 一行之内 */
+    sealTop = Math.min(Math.max(sealTop, lo), hi);
+
+    /* 规则三：水平对准署名轴 */
+    const centerX = sRect.left + sRect.width / 2;
+
+    seal.style.left = (centerX - bRect.left - D / 2) + 'px';
+    seal.style.top  = (sealTop - bRect.top) + 'px';
+
+    const gapMM = ((sealTop - bodyBottom) / MM).toFixed(1);
+    const dropMM = (((sealTop + D / 2) - (bRect.top + bRect.height * 0.5)) / MM).toFixed(1);
+    document.getElementById('seal-readout').textContent =
+      '印章 Ø45mm｜章顶距正文 ' + gapMM + 'mm（≤一行 ' + LINE_TERM_MM + 'mm ✓）' +
+      '｜章心较署名日期块中心偏上 ' + dropMM + 'mm（二者处中心偏下 ✓）';
+  }
+
+  function toggleGuides() {
+    document.querySelectorAll('.sheet').forEach(s => s.classList.toggle('guides'));
+  }
+
+  window.addEventListener('load', () => { setTimeout(placeSeal, 60); });
+  window.addEventListener('resize', placeSeal);
+  document.fonts && document.fonts.ready.then(() => setTimeout(placeSeal, 30));
+</script>
+</body>
+</html>
