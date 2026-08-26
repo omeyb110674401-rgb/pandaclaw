@@ -56,6 +56,7 @@ const boardSchema = z.object({
     authorSessionId: z.string(),
     preview: z.string(),
     wordCount: z.number(),
+    stance: z.string().optional(),
     verdict: z.string().optional(),
     reason: z.string().optional(),
     at: z.number(),

@@ -14,7 +14,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { PandaClawService } from './service.ts'
 import { pcProjection } from './projection.ts'
-import { adjournTool, conveneTool, recordTool, stageTool, submitTool, tallyTool, voteTool } from './tools.ts'
+import { adjournTool, conveneTool, inspectTool, recordTool, stageTool, submitTool, tallyTool, voteTool } from './tools.ts'
 
 export const name = 'pandaclaw'
 
@@ -63,7 +63,7 @@ function installTools(agent: Agent, factories: readonly ToolFactory[]): () => vo
 
 /** 主持人工具面（普通会话专属；子代理永远不是主席台）. */
 function leaderFactories(): readonly ToolFactory[] {
-  return [conveneTool, stageTool, recordTool, tallyTool, adjournTool]
+  return [conveneTool, stageTool, recordTool, tallyTool, adjournTool, inspectTool]
 }
 
 /** 成员工具面（子代理作用域；名单外调用在服务层被拒）. */

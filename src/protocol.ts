@@ -125,12 +125,9 @@ export const WORD_LIMITS = {
 /** 同一议题（同会议同回路阶段）的总轮次上限（三审制，协议 §4）. */
 export const MAX_ROUNDS_PER_STAGE = 3
 
-/** 付表决的应答率门槛：npc 已投票数 / npc 编制 ≥ 2/3（协议 §4 R4）. */
+/** 付表决的应答率门槛：npc 已投票数 / npc 编制 ≥ 2/3（协议 §4 R4）——整数交叉相乘判定. */
 export const QUORUM_NUMERATOR = 2
 export const QUORUM_DENOMINATOR = 3
-
-/** full 验收模式下重大事项终批的通过线（协议 §2 / §4）. */
-export const MAJOR_MATTER_RATIO = 2 / 3
 
 /** 会议类型字（代字规则，docs/research/C-补-P12）. */
 const TYPE_CHARACTERS: Readonly<Record<MeetingType, string>> = {
@@ -200,7 +197,8 @@ export interface TallyResult {
  *
  * 通过 = 赞成 > npc编制 ÷ 2（弃权计入分母不计入分子，算术上等同反对）；
  * full 验收的最终批准阶段改为 赞成 ≥ npc编制 × 2/3；
- * 应答率先行：已应答 npc 数 < 编制 × 2/3 时降级为征询模式（仅供参考）.
+ * 应答率先行：已应答 npc 数未达编制 × 2/3 时降级为征询模式（仅供参考）。
+ * 全部比率用整数交叉相乘判定，杜绝浮点与取整口径漂移.
  * @param ballots - 本阶段全部有效选票.
  * @param npcRoster - npc 编制人数.
  * @param majorMatter - 是否重大事项终批（full 验收的批准/终审阶段）.
@@ -210,17 +208,16 @@ export function tally(ballots: readonly BallotSnapshot[], npcRoster: number, maj
   const nay = ballots.filter(ballot => ballot.stance === '反对').length
   const abstain = ballots.filter(ballot => ballot.stance === '弃权').length
   const responded = ballots.length
-  const quorumFloor = Math.floor((npcRoster * QUORUM_NUMERATOR) / QUORUM_DENOMINATOR)
-  const quorumMet = npcRoster === 1 ? responded >= 1 : responded >= Math.max(quorumFloor, 1)
+  const quorumMet = responded >= 1 && responded * QUORUM_DENOMINATOR >= npcRoster * QUORUM_NUMERATOR
   const mode: TallyResult['mode'] = quorumMet ? 'formal' : 'consultive'
   let passed: boolean
   let rule: string
   if (majorMatter) {
-    // 重大事项：赞成 ≥ 编制 × 2/3（分母仍是全员编制，弃权等同反对）.
-    passed = quorumMet && aye >= npcRoster * MAJOR_MATTER_RATIO
+    // 重大事项终批：赞成 × 3 ≥ 编制 × 2（分母仍是全员编制，弃权等同反对）.
+    passed = quorumMet && aye * 3 >= npcRoster * 2
     rule = `赞成(${aye}) ≥ npc编制(${npcRoster})×2/3`
   } else {
-    // 普通事项：赞成 > 编制 ÷ 2（宪法第64条实践口径）.
+    // 普通事项：赞成 × 2 > 编制（宪法第64条实践口径）.
     passed = quorumMet && aye * 2 > npcRoster
     rule = `赞成(${aye}) > npc编制(${npcRoster})÷2`
   }

@@ -45,6 +45,8 @@ export function apply(ctx: ClientContext): void {
 
   let followed: string | undefined
   let disposeFace: (() => void) | null = null
+  /** binding 尚未发布的会话：一次微任务重试，避免页签错过首次附着. */
+  let retryPending = false
 
   const clear = (): void => {
     disposeFace?.()
@@ -66,7 +68,16 @@ export function apply(ctx: ClientContext): void {
       return
     }
     const binding = sessions.binding(current)
-    if (binding === undefined) return
+    if (binding === undefined) {
+      if (!retryPending) {
+        retryPending = true
+        queueMicrotask(() => {
+          retryPending = false
+          if (followed === current && disposeFace === null) follow()
+        })
+      }
+      return
+    }
     const face = binding.session.projections.faceOf('pandaclaw')
     const pull = (): void => {
       const board = face.getSnapshot() as PcMeetingBoard | undefined

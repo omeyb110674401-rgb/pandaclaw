@@ -23,6 +23,8 @@ export interface PcRecordView {
   /** ≤180 字符预览. */
   readonly preview: string
   readonly wordCount: number
+  /** 结构化表决立场（仅选票记录有）. */
+  readonly stance?: '赞成' | '反对' | '弃权'
   /** M4 准入判定；仅 opinion 有. */
   readonly verdict?: 'admitted' | 'rejected'
   /** 拒收理由；仅 rejected 有. */

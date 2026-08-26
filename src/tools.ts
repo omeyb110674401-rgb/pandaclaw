@@ -45,6 +45,9 @@ const FACT_SCHEMA = (tag: string): FactSchema => ({
   additionalProperties: false,
 })
 
+/** 非事实型返回值（如 pc_inspect 档案详情）的宽松对象契约. */
+const LOOSE_OBJECT: { type: 'object' } = { type: 'object' }
+
 /** 主持人：建会（分配文号＋初始化阶段机）. */
 export function conveneTool(svc: PandaClawService) {
   return {
@@ -188,6 +191,54 @@ export function tallyTool(svc: PandaClawService) {
     async execute(args: { readonly docId: string }, _exec: Exec) {
       try {
         return await svc.tally(args.docId)
+      } catch (error) {
+        translate(error)
+      }
+    },
+  }
+}
+
+/** 主持人：查看会议档案（阶段机/文书全文/计票史）——公文成文与回顾的取数口. */
+export function inspectTool(svc: PandaClawService) {
+  return {
+    name: 'pc_inspect',
+    description:
+      'PandaClaw 查看会议档案：返回会议的阶段机状态、全部文书的全文（意见书/质询/答辩/选票理由/决议要点）与历次计票明细。'
+      + '生成正式公文（决议、纪要、答复）前必须调用本工具取数——内容一律以档案为准，禁止凭记忆编造字段.',
+    parameters: {
+      docId: { type: 'string', required: true, description: '文号.' },
+    },
+    output: {
+      schema: LOOSE_OBJECT,
+      render: (_args: unknown, value: { readonly detail: {
+        readonly meeting: { readonly docId: string; readonly type: string; readonly status: string; readonly stages: readonly { label: string; state: string; round?: number }[] }
+        readonly tallies: readonly { stage: string; round: number; aye: number; nay: number; abstain: number; passed: boolean; mode: string }[]
+        readonly records: readonly { kind: string; authorName: string; round?: number; verdict?: string; text: string }[]
+      } }) => {
+        const d = value.detail
+        const lines: string[] = [
+          `档案 ${d.meeting.docId}（${d.meeting.status}）：`,
+          ...d.meeting.stages.map(stage =>
+            `  ${stage.state === 'done' ? '✔' : stage.state === 'active' ? '▶' : '·'} ${stage.label}${stage.round === undefined ? '' : ` r${stage.round}`}`),
+        ]
+        if (d.tallies.length > 0) {
+          lines.push('计票史：')
+          for (const tally of d.tallies) {
+            lines.push(`  ${tally.stage} r${tally.round}：赞${tally.aye}/反${tally.nay}/弃${tally.abstain} ⇒ ${tally.passed ? '通过' : '未通过'}${tally.mode === 'consultive' ? '(征询模式)' : ''}`)
+          }
+        }
+        lines.push('文书全文：')
+        for (const record of d.records) {
+          const cap = record.kind === 'opinion' || record.kind === 'inquiry' || record.kind === 'vote' || record.kind === 'reply' ? 400 : 800
+          const body = record.text.length > cap ? record.text.slice(0, cap) + '…(截断)' : record.text
+          lines.push(`  [${record.kind}]${record.authorName}${record.round === undefined ? '' : ` r${record.round}`}${record.verdict === undefined ? '' : `(${record.verdict})`}：${body}`)
+        }
+        return [{ type: 'text' as const, text: lines.join('\n') }]
+      },
+    },
+    async execute(args: { readonly docId: string }, _exec: Exec) {
+      try {
+        return { detail: await svc.inspect(args.docId) }
       } catch (error) {
         translate(error)
       }

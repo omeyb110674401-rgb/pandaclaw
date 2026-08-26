@@ -14,8 +14,8 @@ import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
 import type { z } from 'zod'
 import {
-  EMPTY_BOARD, type PcFact, type PcMeetingView, type PcMemberView,
-  type PcRecordView, type PcStageProgress, type PcTallyView,
+  type PcFact, type PcMeetingView, type PcMemberView,
+  type PcRecordView, type PcTallyView,
 } from './contract.ts'
 import { PANDACLAW_DOMAIN, buildRecordId, tallyKey,
   type meetingSchema, type recordSchema, type tallySchema } from './domain.ts'
@@ -143,12 +143,13 @@ export class PandaClawService extends Service {
 
   /**
    * 建会：分配文号、初始化阶段机、落库.
-   * @param actorSessionId - 主持人会话 id.
+   * @param _actorSessionId - 主持人会话 id（预留：建会审计字段，当前版本未落库）.
    * @param request - 建会参数.
    */
-  async convene(actorSessionId: string, request: ConveneRequest): Promise<PcFact> {
-    const parsed = parseDocumentIdPlaceholder(request.type)
-    if (parsed === undefined) throw new PcError('BAD_DOCUMENT_ID', `未知会议类型 ${String(request.type)}`)
+  async convene(_actorSessionId: string, request: ConveneRequest): Promise<PcFact> {
+    if (!(Object.keys(STAGE_FLOWS) as MeetingType[]).includes(request.type)) {
+      throw new PcError('BAD_DOCUMENT_ID', `未知会议类型 ${String(request.type)}`)
+    }
     const tier = request.tier ?? 'medium'
     const validation = request.validation ?? defaultValidation(request.type)
     const expected = TIER_ROSTER[tier]
@@ -186,44 +187,47 @@ export class PandaClawService extends Service {
       createdAt: Date.now(),
     }
     await meetings.put(docId, row)
-    void actorSessionId
     return { pc: 'meeting', meeting: toMeetingView(row) }
   }
 
   /**
-   * 推进阶段机.
+   * 推进阶段机（原子读改写：并发提交与推进不会丢状态）.
    * @param docId - 文号.
    * @param action - `advance`=进入下一阶段（当前阶段置 done）；`round`=当前回路阶段开启新一轮（三审制计数）.
    */
   async stage(docId: string, action: 'advance' | 'round'): Promise<PcFact> {
     const meetings = (await this.domain()).table('meetings')
-    const row = await this.meetingOrThrow(docId)
-    this.assertOpen(row)
-    const flow = STAGE_FLOWS[row.type]
-    const currentIndex = row.stages.findIndex(stage => stage.state === 'active')
-    if (currentIndex < 0) throw new PcError('BAD_STAGE', `会议 ${docId} 无活动阶段，状态异常`)
-    if (action === 'advance') {
-      if (currentIndex >= flow.length - 1) {
-        throw new PcError('BAD_STAGE', `「${flow[currentIndex].label}」已是末阶段：全部阶段完成后用 pc_adjourn 归档散会`)
+    await this.meetingOrThrow(docId)
+    let fact!: PcFact
+    await meetings.update(docId, row => {
+      this.assertOpen(row)
+      const flow = STAGE_FLOWS[row.type]
+      const currentIndex = row.stages.findIndex(stage => stage.state === 'active')
+      if (currentIndex < 0) throw new PcError('BAD_STAGE', `会议 ${docId} 无活动阶段，状态异常`)
+      if (action === 'advance') {
+        if (currentIndex >= flow.length - 1) {
+          throw new PcError('BAD_STAGE', `「${flow[currentIndex].label}」已是末阶段：全部阶段完成后用 pc_adjourn 归档散会`)
+        }
+        const nextDef = flow[currentIndex + 1]
+        row.stages[currentIndex] = { ...row.stages[currentIndex], state: 'done' }
+        row.stages[currentIndex + 1] = nextDef.deliberative
+          ? { id: nextDef.id, state: 'active', round: 1 }
+          : { id: nextDef.id, state: 'active' }
+      } else {
+        const def = flow[currentIndex]
+        if (!def.deliberative) {
+          throw new PcError('NOT_DELIBERATIVE', `「${def.label}」非协商回路阶段，无轮次可言；打回重议只发生在 ⭐ 阶段`)
+        }
+        const currentRound = row.stages[currentIndex].round ?? 1
+        if (currentRound >= MAX_ROUNDS_PER_STAGE) {
+          throw new PcError('ROUND_EXHAUSTED', `「${def.label}」已满 ${MAX_ROUNDS_PER_STAGE} 轮（三审制上限）：提取反对焦点后应终止议题或降级为征询意见存档，不再开新一轮`)
+        }
+        row.stages[currentIndex] = { ...row.stages[currentIndex], round: currentRound + 1 }
       }
-      const nextDef = flow[currentIndex + 1]
-      row.stages[currentIndex] = { ...row.stages[currentIndex], state: 'done' }
-      row.stages[currentIndex + 1] = nextDef.deliberative
-        ? { id: nextDef.id, state: 'active', round: 1 }
-        : { id: nextDef.id, state: 'active' }
-    } else {
-      const def = flow[currentIndex]
-      if (!def.deliberative) {
-        throw new PcError('NOT_DELIBERATIVE', `「${def.label}」非协商回路阶段，无轮次可言；打回重议只发生在 ⭐ 阶段`)
-      }
-      const currentRound = row.stages[currentIndex].round ?? 1
-      if (currentRound >= MAX_ROUNDS_PER_STAGE) {
-        throw new PcError('ROUND_EXHAUSTED', `「${def.label}」已满 ${MAX_ROUNDS_PER_STAGE} 轮（三审制上限）：提取反对焦点后应终止议题或降级为征询意见存档，不再开新一轮`)
-      }
-      row.stages[currentIndex] = { ...row.stages[currentIndex], round: currentRound + 1 }
-    }
-    await meetings.put(docId, row)
-    return { pc: 'meeting', meeting: toMeetingView(row) }
+      fact = { pc: 'meeting', meeting: toMeetingView(row) }
+      return row
+    })
+    return fact
   }
 
   /**
@@ -374,6 +378,7 @@ export class PandaClawService extends Service {
       authorName: input.name,
       authorSessionId: actorSessionId,
       text: `【投票】${input.stance}\n【理由】${input.reason}`,
+      stance: input.stance,
       at: Date.now(),
     })
     return { pc: 'record', record }
@@ -400,7 +405,11 @@ export class PandaClawService extends Service {
       .filter(record => record.kind === 'vote' && record.stage === activeStage.id && record.round === round)
     if (votes.length === 0) throw new PcError('TALLY_EMPTY', '本轮尚无任何选票：先由 npc 成员逐一点名投票')
     const result = mechanicalTally(
-      votes.map(record => ({ stance: /^【投票】赞成/.test(record.text) ? '赞成' : /^【投票】反对/.test(record.text) ? '反对' : '弃权' })),
+      votes.map(record => ({
+        // 结构化立场优先；旧数据回退到文本首行解析.
+        stance: record.stance
+          ?? (/^【投票】赞成/.test(record.text) ? '赞成' : /^【投票】反对/.test(record.text) ? '反对' : '弃权'),
+      })),
       row.npcNames.length,
       isMajorMatter(row.type, activeStage.id, row.validation),
     )
@@ -419,43 +428,49 @@ export class PandaClawService extends Service {
       at: Date.now(),
     }
     await tallies.put(key, tallyRow)
-    const view = toTallyView(tallyRow)
-    if (result.mode === 'consultive') {
-      // 征询模式提示随计票事实一起返回给主持人（决议须标注未达法定状态）.
-    }
-    return { pc: 'tally', tally: view }
+    // 征询模式（mode==='consultive'）随事实返回给主持人：决议须标注未达法定状态.
+    return { pc: 'tally', tally: toTallyView(tallyRow) }
   }
 
   /**
    * 散会归档（红线8：全部阶段完成且已有决议锚点方可归档；搁置终止随时可宣布）.
+   * 决议检查先行于任何状态变更；阶段收尾走原子读改写.
    * @param docId - 文号.
    * @param options - terminate=true 为搁置终止（附原因）.
    */
   async adjourn(docId: string, options: { readonly terminate?: boolean; readonly reason?: string } = {}): Promise<PcFact> {
-    const meetings = (await this.domain()).table('meetings')
     const row = await this.meetingOrThrow(docId)
     this.assertOpen(row)
-    if (options.terminate === true) {
-      row.status = 'terminated'
-      row.closedAt = Date.now()
-      await meetings.put(docId, row)
-      return { pc: 'meeting', meeting: toMeetingView(row) }
+    if (options.terminate !== true) {
+      const records = await this.recordsOf(docId)
+      if (!records.some(record => record.kind === 'resolution')) {
+        throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
+      }
     }
-    const pending = row.stages.filter(stage => stage.state !== 'done')
-    if (pending.length === 1 && row.stages.indexOf(pending[0]) === row.stages.length - 1) {
-      // 仅剩末阶段在活动：散会即视为完成末段（存档动作本身就是收尾）.
-      pending[0].state = 'done'
-    } else if (pending.length > 0) {
-      throw new PcError('ADJOURN_BLOCKED', `尚有 ${pending.length} 个阶段未完成（${pending.map(stage => stage.id).join('、')}）：走完流程再归档；确要放弃请用 terminate 终止并说明原因`)
-    }
-    const records = await this.recordsOf(docId)
-    if (!records.some(record => record.kind === 'resolution')) {
-      throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
-    }
-    row.status = 'adjourned'
-    row.closedAt = Date.now()
-    await meetings.put(docId, row)
-    return { pc: 'meeting', meeting: toMeetingView(row) }
+    const meetings = (await this.domain()).table('meetings')
+    let fact!: PcFact
+    await meetings.update(docId, current => {
+      this.assertOpen(current)
+      if (options.terminate === true) {
+        current.status = 'terminated'
+        current.closedAt = Date.now()
+        fact = { pc: 'meeting', meeting: toMeetingView(current) }
+        return current
+      }
+      const pending = current.stages.filter(stage => stage.state !== 'done')
+      const lastIndexOf = current.stages.length - 1
+      if (pending.length === 1 && current.stages.indexOf(pending[0]) === lastIndexOf) {
+        // 仅剩末阶段在活动：散会即视为完成末段（存档动作本身就是收尾）.
+        pending[0].state = 'done'
+      } else if (pending.length > 0) {
+        throw new PcError('ADJOURN_BLOCKED', `尚有 ${pending.length} 个阶段未完成（${pending.map(stage => stage.id).join('、')}）：走完流程再归档；确要放弃请用 terminate 终止并说明原因`)
+      }
+      current.status = 'adjourned'
+      current.closedAt = Date.now()
+      fact = { pc: 'meeting', meeting: toMeetingView(current) }
+      return current
+    })
+    return fact
   }
 
   /**
@@ -522,6 +537,7 @@ function toRecordView(row: RecordRow): PcRecordView {
     authorSessionId: row.authorSessionId,
     preview: row.text.length > 180 ? row.text.slice(0, 180) + '…' : row.text,
     wordCount: row.text.length,
+    ...(row.stance !== undefined ? { stance: row.stance } : {}),
     ...(row.verdict !== undefined ? { verdict: row.verdict } : {}),
     ...(row.reason !== undefined ? { reason: row.reason } : {}),
     at: row.at,
@@ -535,10 +551,3 @@ function toTallyView(row: TallyRow): PcTallyView {
 function kindLabel(kind: 'opinion' | 'inquiry' | 'reply'): string {
   return kind === 'opinion' ? '意见书' : kind === 'inquiry' ? '质询' : '答辩'
 }
-
-/** convene 入参的类型守卫占位（真实校验由工具 schema 承担）. */
-function parseDocumentIdPlaceholder(type: MeetingType): MeetingType | undefined {
-  return (['MIN', 'RES', 'CON', 'PLA', 'STR', 'LEG'] as const).includes(type) ? type : undefined
-}
-
-export { EMPTY_BOARD }

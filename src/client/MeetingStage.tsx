@@ -120,6 +120,15 @@ function MeetingCard(props: {
         h('span', { style: { color: palette.accent, marginRight: 6 } }, `[${KIND_LABELS[record.kind] ?? record.kind}]`),
         h('span', { style: { marginRight: 6 } }, `[${SEAT_BADGES[record.seat]}]${record.authorName}`),
         record.round === undefined ? null : h('span', { style: { color: palette.dim, marginRight: 6 } }, `r${record.round}`),
+        record.stance !== undefined
+          ? h('span', {
+            style: {
+              marginRight: 6, padding: '0 6px', borderRadius: 8, fontSize: 11,
+              border: `1px solid ${record.stance === '赞成' ? palette.ok : record.stance === '反对' ? palette.accent : palette.dim}`,
+              color: record.stance === '赞成' ? palette.ok : record.stance === '反对' ? palette.accent : palette.dim,
+            },
+          }, record.stance)
+          : null,
         record.verdict === 'rejected' ? h('span', { style: { color: palette.warn, marginRight: 6 } }, '已退回') : null,
         h('span', { style: { color: palette.dim } }, record.preview),
       )),

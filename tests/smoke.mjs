@@ -133,13 +133,13 @@ await svc.vote(NPC_A, { docId: conveneFact.meeting.docId, name: '代表A', stanc
 await expectError('NAME_TAKEN', svc.vote(NPC_B, { docId: conveneFact.meeting.docId, name: '代表A', stance: '赞成', reason: '冒名' }))
 await expectError('DUPLICATE_VOTE', svc.vote(NPC_A, { docId: conveneFact.meeting.docId, name: '代表A', stance: '赞成', reason: '重复票' }))
 
-// —— 一轮计票：1 赞成 vs 编制2 ⇒ 未通过 ——
-await svc.vote(NPC_B, { docId: conveneFact.meeting.docId, name: '代表B', stance: '反对', reason: '事故定责未回应' })
+// —— 一轮计票：仅 1 人应答（应答率 1/2 < 2/3）⇒ 降级征询模式且未通过 ——
 const tallyFail = await svc.tally(conveneFact.meeting.docId)
+assert.equal(tallyFail.tally.mode, 'consultive')
 assert.equal(tallyFail.tally.passed, false)
-assert.equal(tallyFail.tally.rule.includes('2') , true)
+assert.equal(tallyFail.tally.rule, '赞成(1) > npc编制(2)÷2')
 await expectError('ALREADY_RECORDED', svc.tally(conveneFact.meeting.docId))
-ok('机械计票 M1：一轮 1赞/编制2 未通过，且不可重复计票')
+ok('机械计票 M1：应答率不足降级征询模式，且不可重复计票')
 
 // —— 三审制：打回重议 r2 通过 ——
 await svc.chairRecord(LEADER, { docId: conveneFact.meeting.docId, kind: 'focus', text: 'F1 可行性：责任界定缺失；F2 合规：无' })
@@ -152,6 +152,8 @@ await svc.vote(NPC_A, { docId: conveneFact.meeting.docId, name: '代表A', stanc
 await svc.vote(NPC_B, { docId: conveneFact.meeting.docId, name: '代表B', stance: '赞成', reason: '定责清晰' })
 const tallyPass = await svc.tally(conveneFact.meeting.docId)
 assert.equal(tallyPass.tally.passed, true)
+assert.equal(tallyPass.tally.mode, 'formal')
+assert.equal(tallyPass.tally.rule, '赞成(2) > npc编制(2)÷2')
 ok('三审制重议：r2 焦点修订后 2赞 通过')
 
 // —— 收口：审议完成进入发布（末段），归档自动视为完成收尾 ——
@@ -170,5 +172,33 @@ ok('归档门禁：resolution 在案方可散会，散会后只读')
 const detail = await svc.inspect(conveneFact.meeting.docId)
 assert.equal(detail.records.length >= 9, true)
 assert.equal(detail.tallies.length, 2)
+
+// —— 三审制耗尽（MIN/simple，评审每轮否决）——
+const minFact = await svc.convene(LEADER, {
+  type: 'MIN', topic: '例会纪要确认', tier: 'simple', cppccNames: ['书记员', '列席'], npcNames: ['评审'],
+})
+const minId = minFact.meeting.docId
+await svc.stage(minId, 'advance')
+await svc.stage(minId, 'advance') // record → organize → confirm(⭐r1)
+for (let round = 1; round <= 3; round++) {
+  await svc.submit('session-min-a', { docId: minId, name: '书记员', kind: 'opinion', text: '情况：例会已完成。建议：按讨论要点整理纪要存档。' })
+  await svc.submit(NPC_A, { docId: minId, name: '评审', kind: 'inquiry', text: '纪要是否包含行动项清单？' })
+  const ballot = await svc.vote(NPC_A, { docId: minId, name: '评审', stance: '反对', reason: `第${round}轮仍未附行动项` })
+  assert.equal(ballot.record.stance, '反对')
+  if (round < 3) {
+    const failed = await svc.tally(minId)
+    assert.equal(failed.tally.passed, false)
+    await svc.chairRecord(LEADER, { docId: minId, kind: 'focus', text: `F${round}：缺行动项清单` })
+    await svc.stage(minId, 'round')
+  }
+}
+await expectError('ROUND_EXHAUSTED', svc.stage(minId, 'round'))
+ok('三审制上限：第 3 轮后拒绝开新一轮')
+
+// —— 搁置终止条款 + 散会只读 ——
+const terminated = await svc.adjourn(minId, { terminate: true, reason: '三轮未过，议题搁置' })
+assert.equal(terminated.meeting.status, 'terminated')
+await expectError('NOT_OPEN', svc.submit('session-min-a', { docId: minId, name: '书记员', kind: 'opinion', text: '情况：x。建议：y。' }))
+ok('搁置终止：随时可宣布（附原因），终止后只读')
 
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)
