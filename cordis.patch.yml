@@ -1,0 +1,13 @@
+# PandaClaw bundle patch：在底座组合之上插入一行会议服务。
+#
+# 依赖：
+# - `storage-domain` form（web app 组合自带；headless 等单发 profile 需先补
+#   storage/storage-json/storage-domain 三行——见仓库 README 的 headless 小节）；
+# - `agents` / `sessionProjections` / `tools` / `systemPrompt`
+#   （@deepseek-ai/dsh-base 标准组合均提供）；
+# - 底座 agent-team 插件（如 dsh-team）负责成员创建与消息投递，与本插件
+#   无行依赖关系：本插件通过建会名单与子代理作用域工具协作.
+
+- insert:
+    - id: pandaclaw
+      name: dsh-pandaclaw

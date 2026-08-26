@@ -1,0 +1,40 @@
+{
+  "name": "dsh-pandaclaw",
+  "version": "1.0.0",
+  "description": "PandaClaw 民主协商多智能体会议系统：六类会议阶段状态机、M1 机械计票、表决前置门、准入审查的代码级强制 + 浏览器侧会议舞台视图",
+  "license": "MIT",
+  "author": "omeyb110674401-rgb",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/omeyb110674401-rgb/pandaclaw.git"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./client": "./dist/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist/",
+    "cordis.patch.yml",
+    "dsh-manifest.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  }
+}
