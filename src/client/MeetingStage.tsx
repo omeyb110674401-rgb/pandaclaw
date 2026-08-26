@@ -28,6 +28,7 @@ const KIND_LABELS: Record<string, string> = {
   focus: '打回焦点',
   vote: '选票',
   resolution: '决议',
+  rebind: '席位重绑',
 }
 
 /** 席位徽记. */

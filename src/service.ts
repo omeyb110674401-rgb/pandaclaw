@@ -115,15 +115,37 @@ export class PandaClawService extends Service {
     }
   }
 
-  /** 名字席位绑定校验：名单成员 + 首用绑定会话. */
+  /** 名字席位绑定校验：名单成员 + 首用绑定会话；rebind 解锚后由新会话首提交认领（ADR-0007）. */
   private bindSeat(row: MeetingRow, seat: Exclude<Seat, 'chair'>, name: string, sessionId: string, priorRecords: readonly RecordRow[]): void {
     const roster = seat === 'cppcc' ? row.cppccNames : row.npcNames
     if (!roster.includes(name)) {
       throw new PcError('SEAT_FORBIDDEN', `「${name}」不在本场会议的${seat === 'cppcc' ? '政协委员' : '人大代表'}名单内（${roster.join('、')}）；核对身份或自报名`)
     }
-    const prior = priorRecords.find(record => record.authorName === name)
-    if (prior !== undefined && prior.authorSessionId !== sessionId) {
-      throw new PcError('NAME_TAKEN', `「${name}」已由另一会话（${prior.authorSessionId}）绑定；同队成员不得冒用他人名义提交`)
+    const relevant = priorRecords.filter(record => record.authorName === name)
+    if (relevant.length === 0) return
+    const lastRebindIndex = (() => {
+      for (let index = relevant.length - 1; index >= 0; index -= 1) {
+        if (relevant[index].kind === 'rebind') return index
+      }
+      return -1
+    })()
+    if (lastRebindIndex < 0) {
+      const prior = relevant[0]
+      if (prior.authorSessionId !== sessionId) {
+        throw new PcError('NAME_TAKEN', `「${name}」已由另一会话（${prior.authorSessionId}）绑定；同队成员不得冒用他人名义提交。若系断线重启的新会话，请主持人核实后执行 pc_rebind 认证重绑`)
+      }
+      return
+    }
+    // 解锚语义：最近一次 rebind 作废旧绑定，此后首个以该名提交的会话接管席位；
+    // 被解锚的原会话永久失效——崩溃恢复不能变成冒名后门.
+    const beforeRebind = relevant.slice(0, lastRebindIndex)
+    const oldBinder = [...beforeRebind].reverse().find(record => record.kind !== 'rebind')?.authorSessionId
+    const newBinder = relevant.slice(lastRebindIndex + 1).find(record => record.kind !== 'rebind')?.authorSessionId
+    if (sessionId === oldBinder && newBinder !== sessionId) {
+      throw new PcError('NAME_TAKEN', `「${name}」已被主持人认证解锚转移；原会话（${oldBinder}）的绑定已失效，不得再以该名义提交`)
+    }
+    if (newBinder !== undefined && sessionId !== newBinder) {
+      throw new PcError('NAME_TAKEN', `「${name}」在重绑后已由会话（${newBinder}）认领持有`)
     }
   }
 
@@ -283,6 +305,40 @@ export class PandaClawService extends Service {
       authorName: '主持人',
       authorSessionId: actorSessionId,
       text: input.text,
+      at: Date.now(),
+    })
+    return { pc: 'record', record }
+  }
+
+  /**
+   * 席位认证重绑（ADR-0007）：成员代理断线重启后，主持人核实身份并把该名字的
+   * 绑定转移到当前新会话；写 rebind 锚点留痕，此后旧会话同名提交被拒.
+   * @param actorSessionId - 发起重绑的主持人会话 id（审计字段）.
+   * @param input - 文号与要重绑的成员名.
+   */
+  async rebind(actorSessionId: string, input: { readonly docId: string; readonly name: string }): Promise<PcFact> {
+    const row = await this.meetingOrThrow(input.docId)
+    this.assertOpen(row)
+    const isCppcc = row.cppccNames.includes(input.name)
+    if (!isCppcc && !row.npcNames.includes(input.name)) {
+      throw new PcError('SEAT_FORBIDDEN', `「${input.name}」不在本场会议名册内：重绑只针对在册席位`)
+    }
+    const priorRecords = await this.recordsOf(input.docId)
+    const stageId = row.stages.find(stage => stage.state === 'active')?.id ?? row.stages[0].id
+    const relevant = priorRecords.filter(record => record.authorName === input.name)
+    const previous = [...relevant].reverse().find(record => record.kind === 'rebind') ?? relevant[0]
+    const seq = this.nextSeq(priorRecords, record => record.kind === 'rebind' && record.authorName === input.name)
+    const record = await this.putRecord({
+      id: buildRecordId({ docId: input.docId, kind: 'rebind', stage: stageId, authorName: input.name, seq }),
+      docId: input.docId,
+      kind: 'rebind',
+      stage: stageId,
+      seat: isCppcc ? 'cppcc' : 'npc',
+      authorName: input.name,
+      authorSessionId: actorSessionId,
+      text: previous !== undefined
+        ? `席位认证解锚：「${input.name}」的原绑定（会话 ${previous.authorSessionId}）经主持人核实断线重启后作废，待其新会话首次提交即接管席位`
+        : `席位认证解锚：「${input.name}」的绑定清空（主持人发起），首个以该名提交的会话接管`,
       at: Date.now(),
     })
     return { pc: 'record', record }

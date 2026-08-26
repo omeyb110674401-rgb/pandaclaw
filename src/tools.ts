@@ -1,5 +1,5 @@
 /**
- * PandaClaw 模型工具面：主持人五件套 + 成员两件套.
+ * PandaClaw 模型工具面：主持人七件套 + 成员两件套.
  *
  * 工具描述即协议教学：模型只看得到这里与技能正文，因此每个工具的
  * description 自含使用时机与前后置。所有协议裁决在服务层完成，本文件
@@ -250,6 +250,37 @@ export function inspectTool(svc: PandaClawService) {
     async execute(args: { readonly docId: string }, _exec: Exec) {
       try {
         return { detail: await svc.inspect(args.docId) }
+      } catch (error) {
+        translate(error)
+      }
+    },
+  }
+}
+
+/** 主持人：席位认证解锚——成员代理断线重启后清除旧绑定（ADR-0007）. */
+export function rebindTool(svc: PandaClawService) {
+  return {
+    name: 'pc_rebind',
+    description:
+      'PandaClaw 席位认证解锚：成员代理断线重启（新会话同名归来被 NAME_TAKEN 拦截）时，'
+      + '主持人在核实对方确系原成员后调用本工具，作废该名字的旧绑定并留痕；'
+      + '随后成员在新会话重新提交产物即自动接管席位，被解锚的旧会话从此不得再以该名义提交。'
+      + '仅用于断线恢复，不得用于中途换人.',
+    parameters: {
+      docId: { type: 'string', required: true, description: '文号.' },
+      name: { type: 'string', required: true, description: '要重绑的成员名.' },
+    },
+    output: {
+      schema: FACT_SCHEMA('record'),
+      render: (_args: unknown, value: { pc: 'record'; record: { authorName: string } }) => [{
+        type: 'text',
+        text: `席位「${value.record.authorName}」已完成认证解锚；请新会话重新提交任意产物即可接管席位继续履职.`,
+      }],
+      presentationMeta: (_args: unknown, value: PcFact) => value,
+    },
+    async execute(args: { readonly docId: string; readonly name: string }, exec: Exec) {
+      try {
+        return await svc.rebind(String(exec.agent.id), args)
       } catch (error) {
         translate(error)
       }

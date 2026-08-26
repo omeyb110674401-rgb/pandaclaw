@@ -265,4 +265,25 @@ const consultiveAdjourn = await svc.adjourn(con2Id)
 assert.equal(consultiveAdjourn.meeting.status, 'adjourned')
 ok('征询模式三选（ADR-0004）：consultive 不构成表决，采信出口标注非法定状态后可归档')
 
+// —— Q4-C 席位认证解锚（ADR-0007）：断线重启后主持人核实转移，原会话永久失效 ——
+const con3Fact = await svc.convene(LEADER, {
+  type: 'CON', topic: '重绑演练', tier: 'medium',
+  cppccNames: ['架构师', '安全工程师', '增长专家'], npcNames: ['代表A', '代表B'],
+})
+const con3Id = con3Fact.meeting.docId
+await svc.stage(con3Id, 'advance')
+await svc.stage(con3Id, 'advance') // → drafting(⭐r1)
+await svc.submit('session-cppcc-a', { docId: con3Id, name: '架构师', kind: 'opinion', text: goodOpinion })
+await expectError('NAME_TAKEN', svc.submit('session-cppcc-a-reborn', { docId: con3Id, name: '架构师', kind: 'opinion', text: goodOpinion.replace('两周', '四周') }))
+const rebindFact = await svc.rebind(LEADER, { docId: con3Id, name: '架构师' })
+assert.equal(rebindFact.record.kind, 'rebind')
+const rebornOpinion = await svc.submit('session-cppcc-a-reborn', {
+  docId: con3Id, name: '架构师', kind: 'reply',
+  text: '情况说明：断线重启完成，继续以架构师席位履职。',
+})
+assert.equal(rebornOpinion.pc, 'record')
+assert.equal(rebornOpinion.record.kind, 'reply')
+await expectError('NAME_TAKEN', svc.submit('session-cppcc-a', { docId: con3Id, name: '架构师', kind: 'reply', text: '我是原会话，要求收回席位。' }))
+ok('席位认证解锚（ADR-0007）：NAME_TAKEN → 主持人核实解锚 → 新会话首提交接管、原会话永久失效')
+
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)
