@@ -31,6 +31,8 @@ export type RecordKind =
   | 'resolution'
   | 'ruling'
   | 'rebind'
+  | 'warning'
+  | 'supervision'
 
 /** 席位：协商方 / 审查方 / 主持人. */
 export type Seat = 'cppcc' | 'npc' | 'chair'

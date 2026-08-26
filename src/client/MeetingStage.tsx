@@ -34,6 +34,8 @@ const KIND_LABELS: Record<string, string> = {
   resolution: '决议',
   ruling: '裁定',
   rebind: '认证重绑',
+  warning: '关窗预告',
+  supervision: '监督意见',
 }
 
 /** 席位徽记与配色（协=蓝 / 审=绿 / 主=红）. */
@@ -208,6 +210,15 @@ function RecordRow(props: { readonly record: PcRecordView }): ReturnType<typeof 
     h('span', { style: { color: SEAT_COLORS[record.seat] ?? palette.dim, marginRight: 6 } },
       `[${SEAT_BADGES[record.seat] ?? '?'}]${record.authorName}`),
     record.round === undefined ? null : h('span', { style: { color: palette.dim, marginRight: 6 } }, `r${String(record.round)}`),
+    record.kind === 'supervision'
+      ? h('span', {
+        style: {
+          marginRight: 6, padding: '0 6px', borderRadius: 8, fontSize: 11,
+          border: `1px solid ${record.preview.startsWith('【代·替身】') ? '#8e44ad' : palette.warn}`,
+          color: record.preview.startsWith('【代·替身】') ? '#8e44ad' : palette.warn,
+        },
+      }, record.preview.startsWith('【代·替身】') ? '代·替身' : record.preview.startsWith('代录') ? '代录·用户' : '监督')
+      : null,
     record.stance !== undefined
       ? h('span', {
         style: {
@@ -271,6 +282,91 @@ function StageNow(props: { readonly meeting: PcMeetingView }): ReturnType<typeof
     `${STATUS_LABELS[meeting.status] ?? meeting.status}于 ${formatRelative(meeting.closedAt)}`)
 }
 
+/** 一行可复制的定向开场白（监督质疑/复审意见通用）. */
+function Copier(props: { readonly text: string; readonly label: string }): ReturnType<typeof h> {
+  const [copied, setCopied] = useState(false)
+  const copy = () => {
+    // 剪贴板不可用时静默失败，文案可由记录内容手动照抄.
+    navigator.clipboard?.writeText(props.text)?.then(
+      () => {
+        setCopied(true)
+        window.setTimeout(() => setCopied(false), 1600)
+      },
+      () => {},
+    )
+  }
+  return h('button', {
+    onClick: copy,
+    style: {
+      cursor: 'pointer', fontSize: 11, lineHeight: '18px', padding: '1px 10px',
+      borderRadius: 8, marginLeft: 8, border: `1px solid ${palette.accent}`,
+      color: copied ? '#fff' : palette.accent, background: copied ? palette.accent : 'transparent',
+    },
+  }, copied ? '已复制' : props.label)
+}
+
+/**
+ * 监督窗口状态行（ADR-0006/0008/0009）.
+ * 只对 ⭐ 审议阶段渲染；状态全部由协议事件推导（warning/supervision/tally 记录），
+ * 不读墙钟——LLM 本地时钟：窗口随阶段收束而关闭，不存在「等待公示期」.
+ */
+function SupervisionWindow(props: {
+  readonly meeting: PcMeetingView
+  readonly records: readonly PcRecordView[]
+  readonly tallies: readonly PcTallyView[]
+}): ReturnType<typeof h> | null {
+  const { meeting, records, tallies } = props
+  if (meeting.status !== 'open') return null
+  const active = meeting.stages.find(stage => stage.state === 'active')
+  if (active === undefined || !active.deliberative) return null
+  const round = active.round ?? 1
+  const myTallies = tallies.filter(tally => tally.docId === meeting.docId && tally.stage === active.id && tally.round === round)
+  const mySupervision = records.filter(record =>
+    record.docId === meeting.docId && record.kind === 'supervision'
+    && record.stage === active.id && record.round === round)
+  const warned = records.some(record =>
+    record.docId === meeting.docId && record.kind === 'warning'
+    && record.stage === active.id && record.round === round)
+  if (myTallies.length > 0) {
+    return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+      chip('监督窗口 · 已关窗（计票启动）', palette.dim, false))
+  }
+  const standin = mySupervision.some(record => record.preview.startsWith('【代·替身】'))
+  if (standin) {
+    return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+      chip('监督窗口 · 二阶段（替身监督）', '#8e44ad', false),
+      h('span', { style: { color: palette.dim } }, '用户缺席，替身已代提意见；用户回来自动获追认/撤回权'),
+    )
+  }
+  if (mySupervision.length > 0) {
+    return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+      chip('监督窗口 · 用户已回应', palette.ok, false))
+  }
+  // 用户未回应：一阶段（开放）或已预告拟计票（即将关闭），均给最后一拍的可复制开场白.
+  const text = `我作为民众监督者，对当前阶段【${active.label} · r${String(round)}】就议题「${meeting.topic}」提一条监督质疑：〈质疑内容〉。请主持人代录入板并标注「代录·用户」，原汁原味不改写。`
+  if (warned) {
+    return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+      chip('监督窗口 · 即将关闭（已预告拟计票，请及时提出）', palette.warn, false),
+      h(Copier, { text, label: '复制提监督质疑' }),
+    )
+  }
+  return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+    chip('监督窗口 · 开放（一阶段，可提监督质疑）', palette.ok, false),
+    h(Copier, { text, label: '复制提监督质疑' }),
+  )
+}
+
+/** 复审子通道入口（ADR-0006 §113 反馈义务）：已归档案卷上给用户异步监督的复制开场白. */
+function ReviewEntry(props: { readonly meeting: PcMeetingView }): ReturnType<typeof h> | null {
+  const { meeting } = props
+  if (meeting.status !== 'adjourned') return null
+  const text = `对已归档案卷 ${meeting.docId}「${meeting.topic}」提复审意见：〈意见〉。请主持人逐条回告（反馈义务两级制：收集整理＋汇总通报）。`
+  return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
+    chip('复审子通道 · 异步监督', '#8e44ad', false),
+    h(Copier, { text, label: '复制复审意见开场白' }),
+  )
+}
+
 /** 一个案卷的卡片. */
 function MeetingCard(props: {
   readonly meeting: PcMeetingView
@@ -292,6 +388,8 @@ function MeetingCard(props: {
     ),
     h('div', { style: { color: palette.dim, fontSize: 12, margin: '4px 0 2px' } }, `议题：${meeting.topic}`),
     h(StageNow, { meeting }),
+    h(SupervisionWindow, { meeting, records, tallies }),
+    h(ReviewEntry, { meeting }),
     // 阶段进度条
     h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 2, marginBottom: 8 } },
       ...meeting.stages.map(stage => chip(

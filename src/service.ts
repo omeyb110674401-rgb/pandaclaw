@@ -30,8 +30,12 @@ type MeetingRow = z.infer<typeof meetingSchema>
 type RecordRow = z.infer<typeof recordSchema>
 type TallyRow = z.infer<typeof tallySchema>
 
-/** 主持人登记的锚点种类（内容产出物的一行索引，全文可选）. */
-const CHAIR_KINDS: readonly RecordKind[] = ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling']
+/**
+ * 主持人登记的锚点种类.
+ * `warning`：关窗预告（监督窗口二阶段开启，ADR-0008）.
+ * `supervision`：代录入板的用户监督意见或明示放弃（ADR-0006/0009，authorName='用户'）.
+ */
+const CHAIR_KINDS: readonly RecordKind[] = ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling', 'warning', 'supervision']
 
 /** 成员可提交的种类与其法定席位. */
 const MEMBER_KIND_SEATS: Readonly<Partial<Record<RecordKind, Exclude<Seat, 'chair'>>>> = {
@@ -311,6 +315,52 @@ export class PandaClawService extends Service {
   }
 
   /**
+   * 用户监督替身提交监督意见（ADR-0009 二阶段）：用户缺席且未作任何回应输入时，
+   * 主持人经底座以专用 preset（`pc-supervisor-standin`）spawn 替身，替身以本方法
+   * 在本轮 ⭐ 阶段登记一条监督意见（标注「代·替身」），不算票、不替代成员产物
+   * 前置门计数；用户回来自动获得追认/撤回权（对替身意见的消息即为撤销依据）.
+   * @param actorSessionId - 替身会话 id（审计字段）.
+   * @param input - 文号与监督意见.
+   */
+  async superviseStandin(actorSessionId: string, input: { readonly docId: string; readonly text: string }): Promise<PcFact> {
+    const row = await this.meetingOrThrow(input.docId)
+    this.assertOpen(row)
+    const flow = STAGE_FLOWS[row.type]
+    const activeIndex = row.stages.findIndex(stage => stage.state === 'active')
+    const activeStage = row.stages[activeIndex]
+    if (activeStage === undefined || !flow[activeIndex].deliberative) {
+      throw new PcError('NOT_DELIBERATIVE', `会议 ${input.docId} 当前不在协商回路阶段（⭐），不收监督意见（二阶段替身监督只发生在 ⭐ 阶段）`)
+    }
+    if (input.text.trim().length === 0) {
+      throw new PcError('STRUCTURE_FAIL', '监督意见为空')
+    }
+    if (input.text.length > WORD_LIMITS.opinion) {
+      throw new PcError('WORD_LIMIT', `替身监督意见 ${input.text.length} 字超 ${WORD_LIMITS.opinion} 字上限：压缩后重提`)
+    }
+    const round = activeStage.round ?? 1
+    const priorRecords = await this.recordsOf(input.docId)
+    const exists = priorRecords.some(record =>
+      record.kind === 'supervision' && record.stage === activeStage.id && record.round === round && record.authorName === '用户替身')
+    if (exists) {
+      throw new PcError('ALREADY_RECORDED', `本轮（r${round}）用户替身已提交监督意见；如需补充请主持人代录或等下一轮`)
+    }
+    const seq = this.nextSeq(priorRecords, record => record.kind === 'supervision' && record.stage === activeStage.id)
+    const record = await this.putRecord({
+      id: buildRecordId({ docId: input.docId, kind: 'supervision', stage: activeStage.id, round, authorName: '用户替身', seq }),
+      docId: input.docId,
+      kind: 'supervision',
+      stage: activeStage.id,
+      round,
+      seat: 'chair',
+      authorName: '用户替身',
+      authorSessionId: actorSessionId,
+      text: `【代·替身】${input.text}`,
+      at: Date.now(),
+    })
+    return { pc: 'record', record }
+  }
+
+  /**
    * 席位认证重绑（ADR-0007）：成员代理断线重启后，主持人核实身份并把该名字的
    * 绑定转移到当前新会话；写 rebind 锚点留痕，此后旧会话同名提交被拒.
    * @param actorSessionId - 发起重绑的主持人会话 id（审计字段）.
@@ -493,6 +543,28 @@ export class PandaClawService extends Service {
     const key = tallyKey(docId, activeStage.id, round)
     if (tallies.get(key) !== undefined) {
       throw new PcError('ALREADY_RECORDED', `本轮（${activeStage.id} r${round}）已完成计票：未通过时请提炼反对焦点（pc_record focus）后用 pc_stage round 开新一轮`)
+    }
+    // 监督窗口双门（ADR-0008/0009）：仅在计票阶段 ⭐（征意回路）时生效；
+    // MIN 确证豁免（其 ⭐ confirm 是核验语义的更正循环，非征意审议——不侵蚀
+    // 轻量确证通道）；LEG 公布批准非 ⭐ 亦不在其列.
+    const votingStageDef = STAGE_FLOWS[row.type].find(def => def.id === activeStage.id)
+    if (votingStageDef !== undefined && votingStageDef.deliberative && row.type !== 'MIN') {
+      const records = await this.recordsOf(docId)
+      // 门一：关窗预告——拟计票前须先有 warning 记录，关窗由瞬时事件变为可预示事件.
+      const hasWarning = records.some(record =>
+        record.kind === 'warning' && record.stage === activeStage.id && record.round === round)
+      if (!hasWarning) {
+        throw new PcError('WARNING_REQUIRED',
+          `拟对「${activeStage.id} r${round}」计票前须先向用户发出关窗预告：pc_record kind=warning 登记本阶段拟计票通报（此拍内用户仍可提监督质疑）`)
+      }
+      // 门二：监督应答——关窗前必须已有监督记录（本人意见/明示放弃/替身意见）.
+      const hasSupervision = records.some(record =>
+        record.kind === 'supervision' && record.stage === activeStage.id && record.round === round)
+      if (!hasSupervision) {
+        throw new PcError('SUPERVISION_PENDING',
+          `用户监督窗口未收束（r${round}）：用户在场→代录其监督意见或明示放弃（pc_record kind=supervision）；`
+          + '用户缺席→按 ADR-0009 spawn「用户监督替身」，由其以 pc_supervise 提交监督意见（不算票，用户回来自动获追认/撤回权）')
+      }
     }
     const votes = (await this.recordsOf(docId))
       .filter(record => record.kind === 'vote' && record.stage === activeStage.id && record.round === round)

@@ -24,6 +24,8 @@ export type PcErrorCode =
   | 'ALREADY_RECORDED'
   | 'TALLY_EMPTY'
   | 'ADJOURN_BLOCKED'
+  | 'WARNING_REQUIRED'
+  | 'SUPERVISION_PENDING'
 
 /** 携带协议错误码与模型可读理由的异常. */
 export class PcError extends Error {

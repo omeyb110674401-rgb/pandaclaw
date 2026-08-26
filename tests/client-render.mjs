@@ -63,9 +63,11 @@ const board = {
     { id: 'a6', docId: 'PC-20260825-RES-01', kind: 'vote', stage: 'vote', seat: 'cppcc', authorName: '文渊', authorSessionId: 's', preview: '选票：赞成', wordCount: 6, stance: '赞成', at: now - 73_000_000 },
     { id: 'a7', docId: 'PC-20260825-RES-01', kind: 'resolution', stage: 'close', seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '决议：采纳 v1.4.0 UI 方案', wordCount: 88, at: now - 72_000_000 },
     { id: 'a8', docId: 'PC-20260826-CON-01', kind: 'rebind', stage: 'open', seat: 'npc', authorName: '守拙', authorSessionId: 's2', preview: '断线重启，认证重绑接管席位', wordCount: 26, at: now - 1_000_000 },
+    { id: 'a9', docId: 'PC-20260826-CON-01', kind: 'warning', stage: 'r2', round: 2, seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '拟就「R2 草案表决」计票，监督窗口即将关闭，请用户及时提出监督质疑', wordCount: 42, at: now - 900_000 },
+    { id: 'a10', docId: 'PC-20260826-CON-01', kind: 'supervision', stage: 'r2', round: 2, seat: 'chair', authorName: '用户替身', authorSessionId: 's3', preview: '【代·替身】外部审计范围宜先覆盖核心链路，建议关注供应商准入风险', wordCount: 34, at: now - 800_000 },
   ],
   tallies: [
-    { docId: 'PC-20260826-CON-01', stage: 'r2', round: 2, aye: 1, nay: 1, abstain: 0, rosterSize: 3, responded: 2, mode: 'consultive', passed: false, rule: 'double-two-thirds', at: now - 1_500_000 },
+    { docId: 'PC-20260826-CON-01', stage: 'r1', round: 1, aye: 1, nay: 1, abstain: 0, rosterSize: 3, responded: 2, mode: 'consultive', passed: false, rule: 'double-two-thirds', at: now - 1_500_000 },
     { docId: 'PC-20260825-RES-01', stage: 'vote', round: 1, aye: 1, nay: 0, abstain: 0, rosterSize: 1, responded: 1, mode: 'formal', passed: true, rule: 'majority', at: now - 72_100_000 },
   ],
 }
@@ -126,11 +128,13 @@ function expectAll(name, html, needles) {
 console.log('▶ 会议看板渲染')
 const html = renderToString(createElement(Component, { useBoard: selector => selector(board) }))
 
-expectAll('顶栏', html, ['1 案进行中', '1 案已结', '8 条记录', '全部 2', '进行中 1', '已归档 1'])
+expectAll('顶栏', html, ['1 案进行中', '1 案已结', '10 条记录', '全部 2', '进行中 1', '已归档 1'])
 expectAll('会议卡元信息', html, ['案卷号 PC-20260826-CON-01', '协商', '复杂 · 关键点验收', '立案于', '名册（2）'])
 expectAll('当前阶段行', html, ['当前：', 'R2 草案表决', '· r2', '⭐'])
 expectAll('计票历史', html, ['r2', '赞成 1 · 反对 1 · 弃权 0', '应答 2/3', '征询·不构成表决', '未通过', '通过'])
-expectAll('记录流', html, ['记录流（6 条）', '全部 6', '意见书 2', '裁定', '认证重绑', '[协]文渊', '已退回·未达 M4 最低字数', '210字'])
+expectAll('监督窗口', html, ['监督窗口 · 二阶段（替身监督）', '用户回来自动获追认/撤回权'])
+expectAll('复审入口', html, ['复审子通道 · 异步监督', '复制复审意见开场白'])
+expectAll('记录流', html, ['记录流（8 条）', '全部 8', '意见书 2', '监督意见 1', '关窗预告 1', '裁定', '认证重绑', '代·替身', '[协]文渊', '已退回·未达 M4 最低字数', '210字'])
 if (!/border-left:3px solid #c0392b/.test(html)) {
   console.error('  ❌ 决议记录左边框强调缺失')
   failed += 1
@@ -143,6 +147,45 @@ else {
   console.error('  ❌ 排序异常：进行中会议未排在已归档之前')
   failed += 1
 }
+
+// ---- 监督窗口四态（独立小看板，逐态断言）----
+console.log('▶ 监督窗口状态渲染')
+const winMeeting = {
+  docId: 'PC-20260826-CON-99', type: 'CON', tier: 'medium', validation: 'key',
+  topic: '监督窗口四态用例', status: 'open',
+  members: [{ name: '文渊', seat: 'cppcc' }],
+  stages: [{ id: 'r2', label: 'R2 草案表决', deliberative: true, state: 'active', round: 2 }],
+  currentStage: 'r2', createdAt: now - 600_000,
+}
+const winRecords = (extra) => [{ id: 'w1', docId: 'PC-20260826-CON-99', kind: 'warning', stage: 'r2', round: 2, seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '拟计票预告', wordCount: 8, at: now - 500_000 }, ...extra]
+const winTally = [{ docId: 'PC-20260826-CON-99', stage: 'r2', round: 2, aye: 1, nay: 0, abstain: 0, rosterSize: 1, responded: 1, mode: 'formal', passed: true, rule: 'majority', at: now - 100_000 }]
+const winBoard = (records, tallies) => ({ meetings: [winMeeting], records, tallies })
+
+const stateHtml = (records, tallies) => renderToString(createElement(Component, {
+  useBoard: selector => selector(winBoard(records, tallies)),
+}))
+
+// 开放·一阶段：无任何记录
+const openHtml = stateHtml([], [])
+expectAll('开放·一阶段', openHtml, ['监督窗口 · 开放（一阶段，可提监督质疑）', '复制提监督质疑'])
+// 即将关闭：warning 已登记，无监督记录
+const warnedHtml = stateHtml(winRecords([]), [])
+expectAll('即将关闭', warnedHtml, ['监督窗口 · 即将关闭（已预告拟计票，请及时提出）', '复制提监督质疑'])
+// 二阶段·替身：warning + 替身监督
+const standinHtml = stateHtml(winRecords([
+  { id: 's1', docId: 'PC-20260826-CON-99', kind: 'supervision', stage: 'r2', round: 2, seat: 'chair', authorName: '用户替身', authorSessionId: 's3', preview: '【代·替身】建议关注供应商准入风险', wordCount: 18, at: now - 300_000 },
+]), [])
+expectAll('二阶段·替身', standinHtml, ['监督窗口 · 二阶段（替身监督）'])
+// 用户已回应：warning + 用户监督
+const userHtml = stateHtml(winRecords([
+  { id: 's2', docId: 'PC-20260826-CON-99', kind: 'supervision', stage: 'r2', round: 2, seat: 'chair', authorName: '主持人', authorSessionId: 's', preview: '代录·用户：建议分阶段审计', wordCount: 12, at: now - 300_000 },
+]), [])
+expectAll('用户已回应', userHtml, ['监督窗口 · 用户已回应'])
+// 已关窗：warning + 替身监督 + tally
+const closedHtml = stateHtml(winRecords([
+  { id: 's3', docId: 'PC-20260826-CON-99', kind: 'supervision', stage: 'r2', round: 2, seat: 'chair', authorName: '用户替身', authorSessionId: 's3', preview: '【代·替身】建议关注供应商准入风险', wordCount: 18, at: now - 300_000 },
+]), winTally)
+expectAll('已关窗', closedHtml, ['监督窗口 · 已关窗（计票启动）'])
 
 // ---- 空看板 ----
 console.log('▶ 空态快速开始渲染')

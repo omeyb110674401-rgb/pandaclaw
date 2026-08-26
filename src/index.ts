@@ -14,7 +14,7 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { PandaClawService } from './service.ts'
 import { pcProjection } from './projection.ts'
-import { adjournTool, conveneTool, inspectTool, recordTool, rebindTool, stageTool, submitTool, tallyTool, voteTool } from './tools.ts'
+import { adjournTool, conveneTool, inspectTool, recordTool, rebindTool, stageTool, submitTool, superviseTool, tallyTool, voteTool } from './tools.ts'
 
 export const name = 'pandaclaw'
 
@@ -71,6 +71,13 @@ function memberFactories(): readonly ToolFactory[] {
   return [submitTool, voteTool]
 }
 
+/** 用户监督替身工具面（ADR-0009）：以 `pc-supervisor-standin` preset 创建的替身专用，只装监督工具，不碰投票/成员产物. */
+const SUPERVISOR_STANDIN_PRESET = 'pc-supervisor-standin'
+
+function supervisorFactories(): readonly ToolFactory[] {
+  return [superviseTool]
+}
+
 /**
  * 为现有与后续的匹配会话装备工具，直到本注册被卸载.
  * @param ctx - 行上下文.
@@ -111,8 +118,20 @@ export function apply(ctx: Context): void {
       () => equipSessions(pc, leads, leaderFactories()),
       'pandaclaw: leader tools',
     )
+    // 用户监督替身（ADR-0009）：专用 preset 的子代理只装监督面，不进入成员面
+    // （成员面会装 vote/submit，替身不是投票成员）.
     pc.effect(
-      () => equipSessions(pc, agent => !leads(agent), memberFactories()),
+      () => equipSessions(pc, agent => {
+        if (leads(agent)) return false
+        return agent.session.header.agentPreset === SUPERVISOR_STANDIN_PRESET
+      }, supervisorFactories()),
+      'pandaclaw: supervisor-standin tools',
+    )
+    pc.effect(
+      () => equipSessions(pc, agent => {
+        if (leads(agent)) return false
+        return agent.session.header.agentPreset !== SUPERVISOR_STANDIN_PRESET
+      }, memberFactories()),
       'pandaclaw: member tools',
     )
   })

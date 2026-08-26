@@ -128,18 +128,19 @@ export function stageTool(svc: PandaClawService) {
   }
 }
 
-/** 主持人：登记锚点产物（议程/出题/汇总/草案/焦点/决议）. */
+/** 主持人：登记锚点产物（议程/出题/汇总/草案/焦点/决议/关窗预告/监督代录）. */
 export function recordTool(svc: PandaClawService) {
   return {
     name: 'pc_record',
     description:
       'PandaClaw 主持人锚点登记：把你在回路中产出的结构化节点写入会议档案——agenda 议题包 / issue 出题与意见汇总 / digest 质询汇总 / '
       + 'draft 草案 / focus 打回焦点清单 / resolution 决议或纪要成文要点 / ruling 三形态裁定（STR 内圈专用：原则通过／退回修改附意见清单／暂不讨论）。'
-      + '这是阶段机的验收锚点：无 draft 不得付表决，内圈无 ruling 不得进入终审，无 resolution 不得归档.'
+      + '监督窗口专用：warning 关窗预告（拟计票前必须登记，开启监�督二阶段拍）/ supervision 代录用户监督意见或明示放弃（authorName 记「用户」）。'
+      + '这是阶段机的验收锚点：无 draft 不得付表决，内圈无 ruling 不得进入终审，无 resolution 不得归档，无 warning+supervision 不得对 ⭐ 阶段计票.'
       + ' 内容取自板书结构化记录，禁止编造；全文入库供公文溯源.',
     parameters: {
       docId: { type: 'string', required: true, description: '文号.' },
-      kind: { type: 'string', required: true, enum: ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling'], description: '锚点种类.' },
+      kind: { type: 'string', required: true, enum: ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling', 'warning', 'supervision'], description: '锚点种类.' },
       text: { type: 'string', required: true, description: '登记内容（≤4000 字；决议至少含文号、票数明细、成文日期）.' },
       stage: { type: 'string', description: '归属阶段标识；缺省=当前活动阶段.' },
     },
@@ -151,7 +152,7 @@ export function recordTool(svc: PandaClawService) {
       }],
       presentationMeta: (_args: unknown, value: PcFact) => value,
     },
-    async execute(args: { readonly docId: string; readonly kind: 'agenda' | 'issue' | 'digest' | 'draft' | 'focus' | 'resolution'; readonly text: string; readonly stage?: string }, exec: Exec) {
+    async execute(args: { readonly docId: string; readonly kind: 'agenda' | 'issue' | 'digest' | 'draft' | 'focus' | 'resolution' | 'warning' | 'supervision'; readonly text: string; readonly stage?: string }, exec: Exec) {
       try {
         return await svc.chairRecord(String(exec.agent.id), {
           docId: args.docId,
@@ -159,6 +160,40 @@ export function recordTool(svc: PandaClawService) {
           text: args.text,
           ...(args.stage !== undefined ? { stage: args.stage } : {}),
         })
+      } catch (error) {
+        translate(error)
+      }
+    },
+  }
+}
+
+/**
+ * 用户监督替身：监督面工具（ADR-0009 二阶段）。只装给以 `pc-supervisor-standin`
+ * preset 创建的替身会话；替身以此代替用户缺席时的会中监督，不算票、用户可撤回.
+ */
+export function superviseTool(svc: PandaClawService) {
+  return {
+    name: 'pc_supervise',
+    description:
+      'PandaClaw 用户监督替身专用：当前用户缺席（未作任何回应），你以其监督者立场在本轮 ⭐ 阶段'
+      + '登记一条监督意见（自动标注「代·替身」）。意见不算票、不替代成员产物前置门计数、不改变通过规则；'
+      + '只提监督质疑（指出风险/遗漏/程序关切），禁止代替用户表达赞同或反对的立场。'
+      + '这是计票门禁的组成部分：⭐ 阶段无 warning(关窗预告)＋supervision 记录时，pc_tally 被拦截.',
+    parameters: {
+      docId: { type: 'string', required: true, description: '文号.' },
+      text: { type: 'string', required: true, description: '监督意见（≤300 字，一事一案）.' },
+    },
+    output: {
+      schema: FACT_SCHEMA('record'),
+      render: (_args: unknown, value: { pc: 'record'; record: { kind: string; stage: string; round?: number } }) => [{
+        type: 'text',
+        text: `已登记监督意见（阶段 ${value.record.stage}${value.record.round === undefined ? '' : ` r${String(value.record.round)}`}）入档案，标注「代·替身」.`,
+      }],
+      presentationMeta: (_args: unknown, value: PcFact) => value,
+    },
+    async execute(args: { readonly docId: string; readonly text: string }, exec: Exec) {
+      try {
+        return await svc.superviseStandin(String(exec.agent.id), args)
       } catch (error) {
         translate(error)
       }
