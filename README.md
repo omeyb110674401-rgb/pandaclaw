@@ -92,8 +92,8 @@ dsh --profile web                                      # 新会话视图环出�
 
 ```
 浏览器  conversation.view「会议舞台」页签
-        会议卡：案卷号/类型/阶段进度条(⭐回路r1-r3)/名册席位
-        计票实况条 · 记录流 · 空态快速开始卡
+        顶栏统计＋状态筛选 · 会议卡：案卷号/类型/阶段进度条(⭐回路r1-r3)/当前阶段/名册席位
+        计票历史(全轮次·征询标注) · 记录流(种类筛选/退回理由) · 空态快速开始卡
           ▲ faceOf('pandaclaw') 快照推送（客户端零折叠）
 主机    PandaClawService ──自有记录域 pandaclaw(meetings/records/tallies)
         ├ 主席台 6 工具(普通会话) └ 成员 2 工具(子代理作用域)
@@ -114,12 +114,11 @@ dsh --profile web                                      # 新会话视图环出�
 | [C 公文体系](docs/research/C-公文体系.md) | GB/T 9704／15 文种解剖／代字规则／惯用句式语料库（+13 补验卡） |
 | [D 四类文件](docs/research/D-四类文件.md) | 工作报告形成流程／规划衔接／白皮书／公开建言反馈闭环（+13 补验卡） |
 
-M1-M17 逐条裁定见 [docs/协议校准底稿.md](docs/协议校准底稿.md)；架构裁定沿革见 [docs/adr/](docs/adr/)（0001–0006：两层会议模型／确证书语义／收敛单点化／征询呈报三选／程序性批复／监督窗口）。
+M1-M17 逐条裁定见 [docs/协议校准底稿.md](docs/协议校准底稿.md)；架构裁定沿革见 [docs/adr/](docs/adr/)（0001–0007：两层会议模型／确证书语义／收敛单点化／征询呈报三选／程序性批复／监督窗口／席位认证解锚）。
 
 ## 已知限制
 
 - **同队互冒名不设防**：席位绑定拦得住「别的会话冒用名字」，拦不住拿到他人会话的身份；审计字段保证事后可追责。
-- **断线重连的席位死锁**：成员代理会中重启后会被自己前世的绑定挡住（NAME_TAKEN），认证重绑制在路线图中。
 - **滞留记录不参与当轮计票**：成员产物以提交时刻的阶段/轮次为准，阶段推进后落库的滞留记录只进审计链。
 - **Headless 需存储补丁**：单发环境回合即退出，协商屏障失效，需挂 storage 补丁并改走代录模式。
 
@@ -127,7 +126,7 @@ M1-M17 逐条裁定见 [docs/协议校准底稿.md](docs/协议校准底稿.md)�
 
 ```sh
 pnpm install       # 第三方依赖走 .npmrc 配置的镜像源
-pnpm run check     # typecheck + build + smoke（28 项端到端断言）
+pnpm run check     # typecheck + build + smoke（31 项端到端断言）+ 客户端渲染冒烟
 ```
 
 首次开发需把本机部署的 harness 包挂进依赖树（`@deepseek-ai/*` 未全量公开发布）：
@@ -137,14 +136,14 @@ New-Item -ItemType Junction node_modules\@deepseek-ai `
   -Target "$env:USERPROFILE\.npm-global\node_modules\@deepseek-ai\dsh\node_modules\@deepseek-ai"
 ```
 
-构建产物（`dist/`）与 `dsh-manifest.json` 提交进仓库：仓库本身即「元数据声明＋预构建产物」形态，改完源码记得把新 `dist/` 一起提交。
+构建产物（`dist/`）不入库（.gitignore），`files` 字段保证 npm 发包时从磁盘携带；改完源码先 `pnpm run build` 再发布。
 
 ## 文档导航
 
 ```
 src/                                  # 插件源码（host + client 双半包）
-pandaclaw-meeting/SKILL.md            # 协议正文 v2.9（含 §0 使用地图）
-docs/adr/                             # 架构裁定 0001–0006
+pandaclaw-meeting/SKILL.md            # 协议正文 v2.10（含 §0 使用地图）
+docs/adr/                             # 架构裁定 0001–0007
 docs/research/                        # 四线制度调研 57 卡
 docs/协议校准底稿.md                   # M1-M17 制度裁决
 docs/演练脚本.md                       # 两场实测记录
@@ -156,6 +155,8 @@ prototype-v1/                         # v1.0 TypeScript 代码原型（历史版
 
 ## 版本
 
+- **1.4.0** — 会议舞台 UI 富化：顶栏统计与状态筛选、当前阶段行、计票历史全轮次（征询标注）、记录流种类筛选与退回理由、届层/验收档中文化；新增客户端渲染冒烟。
+- **1.3.0** — 席位认证解锚制（ADR-0007，`pc_rebind`，协议 v2.10）；修复桌面端 locale 注入缺失。
 - **1.2.0** — 客户端空态快速开始卡＋协议 v2.9 使用地图；npm 首发版本为 1.1.0（含征询呈报三选，ADR-0004）。
 - v2.0.0 — 架构转型：代码原型 → dsh-team 伴生插件（协议强制＋会议舞台 UI），协议 v2.4。
 - v1.0.0 — TypeScript 多智能体代码原型（保留于 `prototype-v1/`）。
