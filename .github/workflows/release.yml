@@ -1,0 +1,33 @@
+# 发布管线：推送 v* 标签或手动触发时构建、跑全部门禁并发布到 npm。
+#
+# 认证走 npm Trusted Publishing（OIDC，免令牌）：需先在 npmjs 包设置页把
+# Trusted Publisher 配置为本仓库（owner=omeyb110674401-rgb repo=pandaclaw
+# workflow=release.yml）。首次发布前包不存在时无法预配置，先用本地
+# `npm publish --registry=https://registry.npmjs.org` 发出首个版本。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC：trusted publishing 凭据，替代 NPM_TOKEN
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # 自带 npm 11：内置 trusted publishing/OIDC 支持
+          registry-url: 'https://registry.npmjs.org'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      - run: npm publish --registry=https://registry.npmjs.org --access public
