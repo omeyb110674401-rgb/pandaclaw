@@ -173,7 +173,7 @@ const detail = await svc.inspect(conveneFact.meeting.docId)
 assert.equal(detail.records.length >= 9, true)
 assert.equal(detail.tallies.length, 2)
 
-// —— 三审制耗尽（MIN/simple，评审每轮否决）——
+// —— 三审制耗尽（MIN/simple，确证书语义：每轮更正，前置门豁免探针内含）——
 const minFact = await svc.convene(LEADER, {
   type: 'MIN', topic: '例会纪要确认', tier: 'simple', cppccNames: ['书记员', '列席'], npcNames: ['评审'],
 })
@@ -181,24 +181,68 @@ const minId = minFact.meeting.docId
 await svc.stage(minId, 'advance')
 await svc.stage(minId, 'advance') // record → organize → confirm(⭐r1)
 for (let round = 1; round <= 3; round++) {
-  await svc.submit('session-min-a', { docId: minId, name: '书记员', kind: 'opinion', text: '情况：例会已完成。建议：按讨论要点整理纪要存档。' })
-  await svc.submit(NPC_A, { docId: minId, name: '评审', kind: 'inquiry', text: '纪要是否包含行动项清单？' })
-  const ballot = await svc.vote(NPC_A, { docId: minId, name: '评审', stance: '反对', reason: `第${round}轮仍未附行动项` })
-  assert.equal(ballot.record.stance, '反对')
+  // 无任何意见书/质询，确证书直接合法（ADR-0002 前置门豁免）
+  const ballot = await svc.vote(NPC_A, { docId: minId, name: '评审', stance: '更正', reason: `第${round}轮：纪要缺行动项清单` })
+  assert.equal(ballot.record.stance, '更正')
   if (round < 3) {
     const failed = await svc.tally(minId)
     assert.equal(failed.tally.passed, false)
-    await svc.chairRecord(LEADER, { docId: minId, kind: 'focus', text: `F${round}：缺行动项清单` })
+    assert.equal(failed.tally.rule, '无更正(1)=0 且应答1/1达标')
     await svc.stage(minId, 'round')
   }
 }
 await expectError('ROUND_EXHAUSTED', svc.stage(minId, 'round'))
-ok('三审制上限：第 3 轮后拒绝开新一轮')
+ok('更正循环上限：第 3 轮后拒绝再开确证轮')
 
 // —— 搁置终止条款 + 散会只读 ——
 const terminated = await svc.adjourn(minId, { terminate: true, reason: '三轮未过，议题搁置' })
 assert.equal(terminated.meeting.status, 'terminated')
 await expectError('NOT_OPEN', svc.submit('session-min-a', { docId: minId, name: '书记员', kind: 'opinion', text: '情况：x。建议：y。' }))
 ok('搁置终止：随时可宣布（附原因），终止后只读')
+
+// —— MIN 确证通过路径：无更正即确证 → 成文 → 归档 ——
+const min2Fact = await svc.convene(LEADER, {
+  type: 'MIN', topic: '周例会纪要', tier: 'simple', cppccNames: ['书记员', '列席'], npcNames: ['评审'],
+})
+assert.equal(min2Fact.meeting.docId.endsWith('002号'), true)
+const min2Id = min2Fact.meeting.docId
+await svc.stage(min2Id, 'advance')
+await svc.stage(min2Id, 'advance')
+await svc.vote(NPC_A, { docId: min2Id, name: '评审', stance: '确认', reason: '记录如实' })
+const certified = await svc.tally(min2Id)
+assert.equal(certified.tally.passed, true)
+assert.equal(certified.tally.rule, '无更正(0)=0 且应答1/1达标')
+await svc.chairRecord(LEADER, { docId: min2Id, kind: 'resolution', text: '纪要成文要点：三项议题分条记载；评审已确证。' })
+await svc.stage(min2Id, 'advance') // confirm 完成 → archive（末段）
+const archivedMin = await svc.adjourn(min2Id)
+assert.equal(archivedMin.meeting.status, 'adjourned')
+ok('MIN 确证书：无更正即确证，成文后归档')
+
+// —— STR：内圈三形态裁定门 + 终审一致同意（ADR-0003）——
+const strFact = await svc.convene(LEADER, {
+  type: 'STR', topic: '年度战略聚焦', tier: 'medium',
+  cppccNames: ['战略官', '财务官', '市场官'], npcNames: ['代表A', '代表B'],
+})
+const strId = strFact.meeting.docId
+for (let i = 0; i < 4; i++) await svc.stage(strId, 'advance') // → inner-review(⭐r1)
+await svc.submit('session-cppcc-a', { docId: strId, name: '战略官', kind: 'opinion', text: '情况：三条业务线两条亏损。分析：资源分散稀释主线。建议：聚焦主线，剥离边缘业务并妥善安置。' })
+await svc.submit(NPC_A, { docId: strId, name: '代表A', kind: 'inquiry', text: '边缘业务人员的安置方案是否已纳入？' })
+await expectError('RULING_REQUIRED', svc.stage(strId, 'advance'))
+await svc.chairRecord(LEADER, { docId: strId, kind: 'ruling', text: '原则通过：聚焦主线方向；意见处置——安置质询采纳并入草案第4节（双联清单见板书）。' })
+await svc.stage(strId, 'advance') // → final-approval(⭐r1)
+await expectError('STANCE_INVALID', svc.vote(NPC_A, { docId: strId, name: '代表A', stance: '确认', reason: 'x' }))
+await svc.vote(NPC_A, { docId: strId, name: '代表A', stance: '赞成', reason: '聚焦方向正确' })
+await svc.vote(NPC_B, { docId: strId, name: '代表B', stance: '弃权', reason: '安置细节待观察' })
+const unanimousFail = await svc.tally(strId)
+assert.equal(unanimousFail.tally.passed, false)
+assert.equal(unanimousFail.tally.rule, '一致同意：赞成(1) === npc编制(2)')
+await svc.chairRecord(LEADER, { docId: strId, kind: 'focus', text: 'F1：安置细节须书面回应后方可终审' })
+await svc.stage(strId, 'round')
+await svc.vote(NPC_A, { docId: strId, name: '代表A', stance: '赞成', reason: '回应充分' })
+await svc.vote(NPC_B, { docId: strId, name: '代表B', stance: '赞成', reason: '撤回保留' })
+const unanimousPass = await svc.tally(strId)
+assert.equal(unanimousPass.tally.passed, true)
+assert.equal(unanimousPass.tally.rule, '一致同意：赞成(2) === npc编制(2)')
+ok('STR：内圈裁定门 + 终审一致同意（一票即阻，重议后全赞通过）')
 
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)

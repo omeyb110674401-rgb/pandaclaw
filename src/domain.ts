@@ -42,8 +42,8 @@ export const recordSchema = z.object({
   authorName: z.string(),
   authorSessionId: z.string(),
   text: z.string(),
-  /** 结构化表决立场（仅选票行有）；计票读此字段，不再解析文本. */
-  stance: z.enum(['赞成', '反对', '弃权']).optional(),
+  /** 结构化表决立场（仅选票行有）：选票三态或确证书两态；计票读此字段，不再解析文本. */
+  stance: z.enum(['赞成', '反对', '弃权', '确认', '更正']).optional(),
   verdict: z.union([z.literal('admitted'), z.literal('rejected')]).optional(),
   reason: z.string().optional(),
   at: z.number(),

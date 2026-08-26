@@ -21,8 +21,8 @@ import { PANDACLAW_DOMAIN, buildRecordId, tallyKey,
   type meetingSchema, type recordSchema, type tallySchema } from './domain.ts'
 import { PcError } from './errors.ts'
 import {
-  MAX_ROUNDS_PER_STAGE, STAGE_FLOWS, TIER_ROSTER, VOTE_STAGES, WORD_LIMITS,
-  defaultValidation, hasOpinionStructure, isMajorMatter, parseDocumentId, tally as mechanicalTally,
+  MAX_ROUNDS_PER_STAGE, RULING_GATED_STAGES, STAGE_FLOWS, TIER_ROSTER, VOTE_STAGES, WORD_LIMITS,
+  defaultValidation, hasOpinionStructure, passRuleFor, parseDocumentId, stancesFor, tally as mechanicalTally,
   type MeetingType, type RecordKind, type Seat, type Tier, type Validation,
 } from './protocol.ts'
 
@@ -31,7 +31,7 @@ type RecordRow = z.infer<typeof recordSchema>
 type TallyRow = z.infer<typeof tallySchema>
 
 /** 主持人登记的锚点种类（内容产出物的一行索引，全文可选）. */
-const CHAIR_KINDS: readonly RecordKind[] = ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution']
+const CHAIR_KINDS: readonly RecordKind[] = ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling']
 
 /** 成员可提交的种类与其法定席位. */
 const MEMBER_KIND_SEATS: Readonly<Partial<Record<RecordKind, Exclude<Seat, 'chair'>>>> = {
@@ -197,7 +197,23 @@ export class PandaClawService extends Service {
    */
   async stage(docId: string, action: 'advance' | 'round'): Promise<PcFact> {
     const meetings = (await this.domain()).table('meetings')
-    await this.meetingOrThrow(docId)
+    const snapshot = await this.meetingOrThrow(docId)
+    if (action === 'advance') {
+      // 三形态裁定门（ADR-0003）：离开裁定门阶段前必须已有 ruling 锚点.
+      const currentIndex = snapshot.stages.findIndex(stage => stage.state === 'active')
+      if (currentIndex >= 0) {
+        const currentDef = STAGE_FLOWS[snapshot.type][currentIndex]
+        if ((RULING_GATED_STAGES[snapshot.type] ?? []).includes(currentDef.id)) {
+          const gatedRound = snapshot.stages[currentIndex].round ?? 1
+          const hasRuling = (await this.recordsOf(docId)).some(record =>
+            record.kind === 'ruling' && record.stage === currentDef.id && record.round === gatedRound)
+          if (!hasRuling) {
+            throw new PcError('RULING_REQUIRED',
+              `「${currentDef.label}」是三形态裁定门：先以 pc_record 登记 ruling 裁定（原则通过／退回修改附意见清单／暂不讨论），才可推进进入终审`)
+          }
+        }
+      }
+    }
     let fact!: PcFact
     await meetings.update(docId, row => {
       this.assertOpen(row)
@@ -255,11 +271,14 @@ export class PandaClawService extends Service {
     }
     const priorRecords = await this.recordsOf(input.docId)
     const seq = this.nextSeq(priorRecords, record => record.kind === input.kind && record.stage === stageId && record.authorName === '主持人')
+    // 裁定等回路锚点必须带轮次戳，供阶段门禁按 stage+round 精确核验.
+    const stageRound = row.stages.find(stage => stage.id === stageId)?.round
     const record = await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: input.kind, stage: stageId, authorName: '主持人', seq }),
+      id: buildRecordId({ docId: input.docId, kind: input.kind, stage: stageId, ...(stageRound !== undefined ? { round: stageRound } : {}), authorName: '主持人', seq }),
       docId: input.docId,
       kind: input.kind,
       stage: stageId,
+      ...(stageRound !== undefined ? { round: stageRound } : {}),
       seat: 'chair',
       authorName: '主持人',
       authorSessionId: actorSessionId,
@@ -353,20 +372,38 @@ export class PandaClawService extends Service {
     }
     const priorRecords = await this.recordsOf(input.docId)
     this.bindSeat(row, 'npc', input.name, actorSessionId, priorRecords)
+    // 立场集按会议类型切换：MIN=确证书两态，其余=选票三态（ADR-0002）.
+    const allowedStances = stancesFor(row.type)
+    if (!allowedStances.includes(input.stance)) {
+      throw new PcError('STANCE_INVALID', `${row.type} 类会议的立场只允许：${allowedStances.join('/')}；收到「${input.stance}」`)
+    }
     if (input.reason.length > WORD_LIMITS.voteReason) {
       throw new PcError('WORD_LIMIT', `选票理由 ${input.reason.length} 字超 ${WORD_LIMITS.voteReason} 字上限`)
     }
     const round = activeStage.round ?? 1
-    const stageRoundRecords = priorRecords.filter(record => record.stage === activeStage.id && record.round === round)
-    const hasOpinion = stageRoundRecords.some(record => record.kind === 'opinion' && record.verdict === 'admitted')
-    const hasInquiry = stageRoundRecords.some(record => record.kind === 'inquiry')
-    if (!hasOpinion || !hasInquiry) {
-      throw new PcError('PRE_VOTE_GATE',
-        `表决前置门未过（红线2）：本阶段须先有已收录的意见书${hasOpinion ? '' : '（缺意见书）'}与书面质询${hasInquiry ? '' : '（缺质询）'}；`
-        + '请主持人先完成 R1 陈述与 R2 质询再发起投票')
-    }
-    if (stageRoundRecords.some(record => record.kind === 'vote' && record.authorName === input.name)) {
-      throw new PcError('DUPLICATE_VOTE', `「${input.name}」本轮（r${round}）已投过票；一人一票不可更改`)
+    if (row.type !== 'MIN') {
+      if (priorRecords.some(record =>
+        record.kind === 'vote' && record.stage === activeStage.id && record.round === round && record.authorName === input.name)) {
+        throw new PcError('DUPLICATE_VOTE', `「${input.name}」本轮（r${round}）已投过票；一人一票不可更改`)
+      }
+      // 前置门（红线2）；若本收敛点紧随裁定门阶段，上游审议已蒸馏为 ruling，视为已满足.
+      const currentIndex = row.stages.indexOf(activeStage)
+      const previousDefinition = currentIndex > 0 ? STAGE_FLOWS[row.type][currentIndex - 1] : undefined
+      const rulingWaived = previousDefinition !== undefined
+        && (RULING_GATED_STAGES[row.type] ?? []).includes(previousDefinition.id)
+      if (!rulingWaived) {
+        const stageRoundRecords = priorRecords.filter(record => record.stage === activeStage.id && record.round === round)
+        const hasOpinion = stageRoundRecords.some(record => record.kind === 'opinion' && record.verdict === 'admitted')
+        const hasInquiry = stageRoundRecords.some(record => record.kind === 'inquiry')
+        if (!hasOpinion || !hasInquiry) {
+          throw new PcError('PRE_VOTE_GATE',
+            `表决前置门未过（红线2）：本阶段须先有已收录的意见书${hasOpinion ? '' : '（缺意见书）'}与书面质询${hasInquiry ? '' : '（缺质询）'}；`
+            + '请主持人先完成 R1 陈述与 R2 质询再发起投票')
+        }
+      }
+    } else if (priorRecords.some(record =>
+      record.kind === 'vote' && record.stage === activeStage.id && record.round === round && record.authorName === input.name)) {
+      throw new PcError('DUPLICATE_VOTE', `「${input.name}」本轮（r${round}）已提交过确证书；如需改口请待主持人重新发起确证`)
     }
     const record = await this.putRecord({
       id: buildRecordId({ docId: input.docId, kind: 'vote', stage: activeStage.id, round, authorName: input.name, seq: 1 }),
@@ -406,12 +443,12 @@ export class PandaClawService extends Service {
     if (votes.length === 0) throw new PcError('TALLY_EMPTY', '本轮尚无任何选票：先由 npc 成员逐一点名投票')
     const result = mechanicalTally(
       votes.map(record => ({
-        // 结构化立场优先；旧数据回退到文本首行解析.
+        // 结构化立场优先；旧数据回退到文本首行解析（仅选票三态，MIN 确证书无旧数据）.
         stance: record.stance
           ?? (/^【投票】赞成/.test(record.text) ? '赞成' : /^【投票】反对/.test(record.text) ? '反对' : '弃权'),
       })),
       row.npcNames.length,
-      isMajorMatter(row.type, activeStage.id, row.validation),
+      passRuleFor(row.type, activeStage.id, row.validation),
     )
     const tallyRow: TallyRow = {
       docId,

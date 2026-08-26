@@ -97,7 +97,7 @@ export function stageTool(svc: PandaClawService) {
   return {
     name: 'pc_stage',
     description:
-      'PandaClaw 阶段推进。action=advance：当前阶段收尾并进入下一阶段（只能沿阶段流前进，禁止跳步）；'
+      'PandaClaw 阶段推进。action=advance：当前阶段收尾并进入下一阶段（只能沿阶段流前进，禁止跳步；离开 STR 内圈须先有 ruling 裁定锚点）；'
       + `action=round：当前 ⭐ 回路阶段打回重议开启新一轮（同一议题至多 ${MAX_ROUNDS_PER_STAGE} 轮，三审制上限）。`
       + '表决未通过时：先用 pc_record 登记 focus（反对焦点提炼），再调 pc_stage round 开新一轮.',
     parameters: {
@@ -134,11 +134,12 @@ export function recordTool(svc: PandaClawService) {
     name: 'pc_record',
     description:
       'PandaClaw 主持人锚点登记：把你在回路中产出的结构化节点写入会议档案——agenda 议题包 / issue 出题与意见汇总 / digest 质询汇总 / '
-      + 'draft 草案 / focus 打回焦点清单 / resolution 决议或纪要成文要点。这是阶段机的验收锚点：无 draft 不得付表决，无 resolution 不得归档.'
+      + 'draft 草案 / focus 打回焦点清单 / resolution 决议或纪要成文要点 / ruling 三形态裁定（STR 内圈专用：原则通过／退回修改附意见清单／暂不讨论）。'
+      + '这是阶段机的验收锚点：无 draft 不得付表决，内圈无 ruling 不得进入终审，无 resolution 不得归档.'
       + ' 内容取自板书结构化记录，禁止编造；全文入库供公文溯源.',
     parameters: {
       docId: { type: 'string', required: true, description: '文号.' },
-      kind: { type: 'string', required: true, enum: ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution'], description: '锚点种类.' },
+      kind: { type: 'string', required: true, enum: ['agenda', 'issue', 'digest', 'draft', 'focus', 'resolution', 'ruling'], description: '锚点种类.' },
       text: { type: 'string', required: true, description: '登记内容（≤4000 字；决议至少含文号、票数明细、成文日期）.' },
       stage: { type: 'string', description: '归属阶段标识；缺省=当前活动阶段.' },
     },
@@ -319,14 +320,15 @@ export function voteTool(svc: PandaClawService) {
   return {
     name: 'pc_vote',
     description:
-      `PandaClaw 表决通道（仅限 npc 人大代表）：对当前回路阶段的草案投票。选票理由≤${WORD_LIMITS.voteReason}字；`
-      + '一人一票不可更改；前置门未过（本阶段缺已收录的意见书或质询）会被拒绝——那是程序未走到，不是你的错。'
-      + '反对时理由要具体到可提炼为质询焦点（可行性/合规性/风险点）.',
+      `PandaClaw 收敛通道（仅限 npc 人大代表），语义按会议类型自动切换：`
+      + '决议类会议＝选票（赞成/反对/弃权；须过前置门——本阶段已有已收录意见书与书面质询）；'
+      + 'MIN 纪要型＝确证书（确认/更正；回答「这份记录是否如实」，无需意见书与质询，更正内容写入理由）。'
+      + `理由≤${WORD_LIMITS.voteReason}字；一人一票不可更改。`,
     parameters: {
       docId: { type: 'string', required: true, description: '文号.' },
       name: { type: 'string', required: true, description: '你的 npc 名单自报名.' },
-      stance: { type: 'string', required: true, enum: ['赞成', '反对', '弃权'], description: '表决立场.' },
-      reason: { type: 'string', required: true, description: `理由（≤${WORD_LIMITS.voteReason}字；弃权也应说明保留意见）.` },
+      stance: { type: 'string', required: true, enum: ['赞成', '反对', '弃权', '确认', '更正'], description: '立场：决议类用赞成/反对/弃权；MIN 用确认/更正.' },
+      reason: { type: 'string', required: true, description: `理由（≤${WORD_LIMITS.voteReason}字；MIN 更正时写明失真处）.` },
     },
     output: {
       schema: FACT_SCHEMA('record'),
