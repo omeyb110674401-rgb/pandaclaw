@@ -465,7 +465,7 @@ export class PandaClawService extends Service {
       at: Date.now(),
     }
     await tallies.put(key, tallyRow)
-    // 征询模式（mode==='consultive'）随事实返回给主持人：决议须标注未达法定状态.
+    // 征询模式（mode==='consultive'）：该轮不构成表决（ADR-0004）；出口＝主持人呈报用户三选裁定，引擎不加门禁.
     return { pc: 'tally', tally: toTallyView(tallyRow) }
   }
 

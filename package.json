@@ -1,6 +1,6 @@
 {
   "name": "dsh-pandaclaw",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "PandaClaw 民主协商多智能体会议系统：dsh-team 之上的伴生插件，提供六类会议阶段状态机、M1 机械计票、表决前置门、准入审查等代码级强制，以及浏览器侧会议舞台视图",
   "type": "module",
   "main": "dist/index.js",

@@ -245,4 +245,24 @@ assert.equal(unanimousPass.tally.passed, true)
 assert.equal(unanimousPass.tally.rule, '一致同意：赞成(2) === npc编制(2)')
 ok('STR：内圈裁定门 + 终审一致同意（一票即阻，重议后全赞通过）')
 
+// —— 征询模式呈报三选（ADR-0004）：consultive 不构成表决，①采信出口可归档 ——
+const con2Fact = await svc.convene(LEADER, {
+  type: 'CON', topic: '日志留存规范征询', tier: 'medium',
+  cppccNames: ['架构师', '安全工程师', '增长专家'], npcNames: ['代表A', '代表B'],
+})
+const con2Id = con2Fact.meeting.docId
+for (let i = 0; i < 4; i++) await svc.stage(con2Id, 'advance') // 立项→调研→起草→征求意见→审议(⭐r1)
+await svc.submit('session-cppcc-a', { docId: con2Id, name: '架构师', kind: 'opinion', text: goodOpinion })
+await svc.submit(NPC_A, { docId: con2Id, name: '代表A', kind: 'inquiry', text: '日志留存期限的合规依据是什么？' })
+await svc.vote(NPC_A, { docId: con2Id, name: '代表A', stance: '赞成', reason: '规范必要' })
+const consultiveTally = await svc.tally(con2Id)
+assert.equal(consultiveTally.tally.mode, 'consultive')
+assert.equal(consultiveTally.tally.passed, false)
+// 出口②再议／③终止由既有原语承载（前文路径已覆盖）；此处验证①采信：决议标注非法定状态后照常收尾归档——引擎无门禁
+await svc.chairRecord(LEADER, { docId: con2Id, kind: 'resolution', text: '决议（征询采信·未达法定状态）：采纳日志规范意见；应答 1/2 未达 2/3，本结论仅供参考。' })
+await svc.stage(con2Id, 'advance') // 审议完成 → 发布（末段）
+const consultiveAdjourn = await svc.adjourn(con2Id)
+assert.equal(consultiveAdjourn.meeting.status, 'adjourned')
+ok('征询模式三选（ADR-0004）：consultive 不构成表决，采信出口标注非法定状态后可归档')
+
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)

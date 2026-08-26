@@ -173,20 +173,30 @@ export function tallyTool(svc: PandaClawService) {
     description:
       'PandaClaw 机械计票：汇总本轮全部选票，验证 npc 应答率 ≥2/3，按 M1 公式裁决——'
       + '普通事项 通过=赞成>npc编制÷2（弃权计入分母，算术等同反对）；full 验收的终批阶段 改为赞成≥编制×2/3。'
-      + '未达应答率自动降级征询模式（决议须标注未达法定状态）。每轮只可计票一次；未通过→提炼焦点→pc_stage round 重议.',
+      + '未达应答率⇒降级征询模式：该轮计票不构成表决（协议自定语义），须呈报用户三选裁定——采信归档／焦点再议一轮／终止议题；'
+      + '法定表决未通过→提炼焦点→pc_stage round 重议。每轮只可计票一次.',
     parameters: {
       docId: { type: 'string', required: true, description: '文号.' },
     },
     output: {
       schema: FACT_SCHEMA('tally'),
-      render: (_args: unknown, value: { pc: 'tally'; tally: { passed: boolean; mode: string; aye: number; nay: number; abstain: number; rule: string } }) => [{
-        type: 'text',
-        text: `计票：赞成${value.tally.aye} / 反对${value.tally.nay} / 弃权${value.tally.abstain} —— ${value.tally.rule}`
-          + ` ⇒ ${value.tally.passed ? '通过' : '不通过'}${value.tally.mode === 'consultive' ? '（征询模式：未达法定应答率，结果仅供参考）' : ''}`
-          + (value.tally.passed
-            ? '。下一步：pc_record resolution 登记决议要点（含票数明细与成文日期），随后 pc_stage advance。'
-            : '。下一步：从反对理由提炼质询焦点 → pc_record focus → pc_stage round 打回重议（三审制内）。'),
-      }],
+      render: (_args: unknown, value: { pc: 'tally'; tally: { passed: boolean; mode: string; aye: number; nay: number; abstain: number; rule: string } }) => {
+        const consultive = value.tally.mode === 'consultive'
+        const verdict = consultive
+          ? '征询模式（未达法定应答率，本计票不构成表决）'
+          : value.tally.passed ? '通过' : '不通过'
+        return [{
+          type: 'text',
+          text: `计票：赞成${value.tally.aye} / 反对${value.tally.nay} / 弃权${value.tally.abstain} —— ${value.tally.rule}`
+            + ` ⇒ ${verdict}`
+            + (consultive
+              ? '。呈报用户三选：①采信＝pc_record resolution（正文强制标注「征询采信·未达法定状态」）后走完阶段收尾归档；'
+                + '②再议＝pc_record focus 提炼缺席与分歧要点 → pc_stage round；③终止＝pc_adjourn terminate 附原因。'
+              : value.tally.passed
+                ? '。下一步：pc_record resolution 登记决议要点（含票数明细与成文日期），随后 pc_stage advance。'
+                : '。下一步：从反对理由提炼质询焦点 → pc_record focus → pc_stage round 打回重议（三审制内）。'),
+        }]
+      },
       presentationMeta: (_args: unknown, value: PcFact) => value,
     },
     async execute(args: { readonly docId: string }, _exec: Exec) {
@@ -225,7 +235,7 @@ export function inspectTool(svc: PandaClawService) {
         if (d.tallies.length > 0) {
           lines.push('计票史：')
           for (const tally of d.tallies) {
-            lines.push(`  ${tally.stage} r${tally.round}：赞${tally.aye}/反${tally.nay}/弃${tally.abstain} ⇒ ${tally.passed ? '通过' : '未通过'}${tally.mode === 'consultive' ? '(征询模式)' : ''}`)
+            lines.push(`  ${tally.stage} r${tally.round}：赞${tally.aye}/反${tally.nay}/弃${tally.abstain} ⇒ ${tally.passed ? '通过' : '未通过'}${tally.mode === 'consultive' ? '(征询模式·未构成表决)' : ''}`)
           }
         }
         lines.push('文书全文：')
