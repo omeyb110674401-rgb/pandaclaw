@@ -72,6 +72,10 @@ export interface PcReviewView {
   readonly choice?: 'revise' | 'interpret' | 'dismiss'
   readonly revisedDocId?: string
   readonly interpretRecordId?: string
+  /** 修订来源（Q14-A）：本卷修订自哪个原卷（新卷侧谱系）. */
+  readonly originDocId?: string
+  /** 修订来源的上轮审查结论摘要（Q14-A，注入审查包供核验）. */
+  readonly sourceReviewNote?: string
   readonly priority?: number
 }
 

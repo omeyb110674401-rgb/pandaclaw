@@ -35,6 +35,7 @@ export type RecordKind =
   | 'supervision'
   | 'review'
   | 'review-reply'
+  | 'review-event'
 
 /** 席位：协商方 / 审查方 / 主持人. */
 export type Seat = 'cppcc' | 'npc' | 'chair'
@@ -385,3 +386,12 @@ export const MAX_REVIEW_PER_DOC = 10
 
 /** 复审审查意见的字数上限（审查替身产出，代码硬编码的 setup 规约）. */
 export const REVIEW_OPINION_LIMIT = 600
+
+/**
+ * 审查意见三分类（Q19-A 收敛）：维持／建议修订／建议解释。
+ * 「建议驳回」不再产出——同词异义（替身的「建议驳回」按备案审查同构＝建议撤销原决议，
+ * 与用户出口「驳回并说明」＝驳回审查建议、维持原决议方向相反）且批量驳回会把
+ * 「建议撤销」一键「维持」——方向性错误；撤销作为修订子形态经重议产出.
+ * 旧数据中的「建议驳回」记录保留（兼容读取），batch-dismiss 对含该词的档案逐件三选.
+ */
+export const REVIEW_VERDICTS: readonly string[] = ['维持', '建议修订', '建议解释']

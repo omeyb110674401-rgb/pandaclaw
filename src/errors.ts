@@ -33,6 +33,7 @@ export type PcErrorCode =
   | 'REVIEW_CHOICE_INVALID'    // 出口三选值非法
   | 'REVIEW_ALREADY_CLOSED'    // 复审已闭环
   | 'REVIEW_REPLY_PENDING'     // 回告未齐备（feedback 阶段逐条回执未完）
+  | 'REVIEW_SPAWN_FAILED'      // 替身派发失败（用户语境可见性，Q8-A：抛给发起人）
 
 /** 携带协议错误码与模型可读理由的异常. */
 export class PcError extends Error {

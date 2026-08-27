@@ -349,7 +349,14 @@ ok('复审门槛：未归档拒审 / MIN 不产生新决定拒审')
 
 // —— 归档泵自动 spawn 审查替身（Q3-B：桩捕获 spawn 参数；泵只在归档位点处理主力档）——
 const spawned = []
-const svcWithSpawn = new PandaClawService(ctx, { spawner: { spawnReviewer: async (docId, review) => { spawned.push({ docId, hasResolution: review.hasResolution, reviewFlag: review.reviewFlag }) } } })
+const disposed = []
+const svcWithSpawn = new PandaClawService(ctx, {
+  spawner: {
+    spawnReviewer: async (docId, review) => { spawned.push({ docId, hasResolution: review.hasResolution, reviewFlag: review.reviewFlag, originDocId: review.originDocId, sourceReviewNote: review.sourceReviewNote }) },
+    disposeReviewer: async docId => { disposed.push(docId) },
+    disposeAllStandins: async () => {},
+  },
+})
 // resId 已在 svc.adjourn 时被泵推进到 reviewing（svc 无 spawner 故无 spawn）；验证状态已是 reviewing.
 const reviewing = await svcWithSpawn.inspect(resId)
 assert.equal(reviewing.meeting.review?.state, 'reviewing')
@@ -445,5 +452,156 @@ const con4Replied = await svcWithSpawn.reviewReply(LEADER, { docId: con4Id, text
 assert.equal(con4Replied.meeting.review?.state, 'closed')
 assert.equal(con4Replied.meeting.review?.count, 0)
 ok('逐条回告闭环（Q5-C）：批量驳回后按条回告即闭环')
+
+// —— Q19：batch-dismiss 三分类收敛——「建议驳回」旧数据逐件（防方向性错误） ——
+const oldDismissDoc = await svcWithSpawn.convene(LEADER, { type: 'RES', topic: '旧数据', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+await svcWithSpawn.stage(oldDismissDoc.meeting.docId, 'advance')
+await svcWithSpawn.stage(oldDismissDoc.meeting.docId, 'advance')
+await svcWithSpawn.submit('session-cppcc-a', { docId: oldDismissDoc.meeting.docId, name: 'a', kind: 'opinion', text: goodOpinion })
+await svcWithSpawn.submit(NPC_A, { docId: oldDismissDoc.meeting.docId, name: 'c', kind: 'inquiry', text: 'RTO？' })
+await svcWithSpawn.vote(NPC_A, { docId: oldDismissDoc.meeting.docId, name: 'c', stance: '赞成', reason: 'ok' })
+await svcWithSpawn.chairRecord(LEADER, { docId: oldDismissDoc.meeting.docId, kind: 'warning', text: '预告' })
+await svcWithSpawn.chairRecord(LEADER, { docId: oldDismissDoc.meeting.docId, kind: 'supervision', text: '无需监督' })
+await svcWithSpawn.tally(oldDismissDoc.meeting.docId)
+await svcWithSpawn.chairRecord(LEADER, { docId: oldDismissDoc.meeting.docId, kind: 'resolution', text: '决议：Y。' })
+await svcWithSpawn.stage(oldDismissDoc.meeting.docId, 'advance')
+await svcWithSpawn.adjourn(oldDismissDoc.meeting.docId) // 归档泵出审 → reviewing
+
+await svcWithSpawn.reviewVerdict('session-reviewer', {
+  docId: oldDismissDoc.meeting.docId,
+  verdict: '建议驳回：本决议与现行制度冲突，建议撤销原决议', // 旧数据形态（Q19 后不再产出，兼容读取）
+  disposal: '处置：建议驳回原决议',
+})
+assert.equal((await svcWithSpawn.inspect(oldDismissDoc.meeting.docId)).meeting.review?.state, 'decidable')
+const batch19 = await svcWithSpawn.reviewBatchDismiss(LEADER, { docIds: [oldDismissDoc.meeting.docId] })
+const oldBatch = batch19.find(item => item.docId === oldDismissDoc.meeting.docId)
+assert.equal(oldBatch?.state, 'decidable', '「建议驳回」旧数据应逐件三选（不批量维持）')
+assert.ok(oldBatch?.note?.includes('逐件'), '「建议驳回」应提示逐件三选')
+ok('batch-dismiss 三分类收敛（Q19）：仅「维持」批量；「建议驳回」旧数据逐件防方向性错误')
+
+// —— Q17-A/Q18-A 归档门禁：表决阶段无 tally 拦归档（决定必经表决） ——
+const gateBlocked = await svcWithSpawn.convene(LEADER, { type: 'RES', topic: '门禁拦截', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+await svcWithSpawn.stage(gateBlocked.meeting.docId, 'advance')
+await svcWithSpawn.stage(gateBlocked.meeting.docId, 'advance') // → deliberation(⭐r1)
+await svcWithSpawn.submit('session-cppcc-a', { docId: gateBlocked.meeting.docId, name: 'a', kind: 'opinion', text: goodOpinion })
+await svcWithSpawn.submit(NPC_A, { docId: gateBlocked.meeting.docId, name: 'c', kind: 'inquiry', text: 'RTO？' })
+await svcWithSpawn.vote(NPC_A, { docId: gateBlocked.meeting.docId, name: 'c', stance: '赞成', reason: 'ok' })
+await svcWithSpawn.chairRecord(LEADER, { docId: gateBlocked.meeting.docId, kind: 'warning', text: '预告' })
+await svcWithSpawn.chairRecord(LEADER, { docId: gateBlocked.meeting.docId, kind: 'supervision', text: '无需监督' })
+// 先决议（无 tally）→ 推进到末段 → 归档应被「决定必经表决」门禁拦下.
+await svcWithSpawn.chairRecord(LEADER, { docId: gateBlocked.meeting.docId, kind: 'resolution', text: '决议：跳过计票直接成文。' })
+await svcWithSpawn.stage(gateBlocked.meeting.docId, 'advance') // → publish（末段）
+await expectError('ADJOURN_BLOCKED', svcWithSpawn.adjourn(gateBlocked.meeting.docId)) // 无 tally 拦归档
+// 对照：先 tally 再归档——成功.
+const gateFact = await svcWithSpawn.convene(LEADER, { type: 'RES', topic: '门禁通过', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+await svcWithSpawn.stage(gateFact.meeting.docId, 'advance')
+await svcWithSpawn.stage(gateFact.meeting.docId, 'advance')
+await svcWithSpawn.submit('session-cppcc-a', { docId: gateFact.meeting.docId, name: 'a', kind: 'opinion', text: goodOpinion })
+await svcWithSpawn.submit(NPC_A, { docId: gateFact.meeting.docId, name: 'c', kind: 'inquiry', text: 'RTO？' })
+await svcWithSpawn.vote(NPC_A, { docId: gateFact.meeting.docId, name: 'c', stance: '赞成', reason: 'ok' })
+await svcWithSpawn.chairRecord(LEADER, { docId: gateFact.meeting.docId, kind: 'warning', text: '预告' })
+await svcWithSpawn.chairRecord(LEADER, { docId: gateFact.meeting.docId, kind: 'supervision', text: '无需监督' })
+await svcWithSpawn.tally(gateFact.meeting.docId)
+await svcWithSpawn.chairRecord(LEADER, { docId: gateFact.meeting.docId, kind: 'resolution', text: '决议：OK。' })
+await svcWithSpawn.stage(gateFact.meeting.docId, 'advance')
+const gateAdjourned = await svcWithSpawn.adjourn(gateFact.meeting.docId)
+assert.equal(gateAdjourned.meeting.status, 'adjourned')
+ok('归档门禁 tally（Q17/Q18）：表决阶段无计票记录拦归档，先计票后可归档')
+
+// —— Q2/Q4/Q8：spawn 失败回滚 filed；自动语境静默、用户语境抛错 ——
+const failSpawned = []
+const failDisposed = []
+const svcFailSpawn = new PandaClawService(ctx, {
+  spawner: {
+    spawnReviewer: async () => { throw new Error('底座未就绪') },
+    disposeReviewer: async docId => { failDisposed.push(docId) },
+    disposeAllStandins: async () => {},
+  },
+})
+const failRes = await svcFailSpawn.convene(LEADER, { type: 'RES', topic: '失败演练', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+await svcFailSpawn.stage(failRes.meeting.docId, 'advance')
+await svcFailSpawn.stage(failRes.meeting.docId, 'advance')
+await svcFailSpawn.submit('session-cppcc-a', { docId: failRes.meeting.docId, name: 'a', kind: 'opinion', text: goodOpinion })
+await svcFailSpawn.submit(NPC_A, { docId: failRes.meeting.docId, name: 'c', kind: 'inquiry', text: 'RTO？' })
+await svcFailSpawn.vote(NPC_A, { docId: failRes.meeting.docId, name: 'c', stance: '赞成', reason: 'ok' })
+await svcFailSpawn.chairRecord(LEADER, { docId: failRes.meeting.docId, kind: 'warning', text: '预告' })
+await svcFailSpawn.chairRecord(LEADER, { docId: failRes.meeting.docId, kind: 'supervision', text: '无需监督' })
+await svcFailSpawn.tally(failRes.meeting.docId)
+await svcFailSpawn.chairRecord(LEADER, { docId: failRes.meeting.docId, kind: 'resolution', text: '决议：X。' })
+await svcFailSpawn.stage(failRes.meeting.docId, 'advance')
+await svcFailSpawn.adjourn(failRes.meeting.docId) // 归档泵：spawn 失败 → 自动语境静默回滚 filed（不抛错）
+const failAfterPump = await svcFailSpawn.inspect(failRes.meeting.docId)
+assert.equal(failAfterPump.meeting.review?.state, 'filed', 'spawn 失败应回滚 filed 留池')
+// review-event 已落板（Q7）
+const failRecords = failAfterPump.records
+assert.ok(failRecords.some(record => record.kind === 'review-event' && record.preview.includes('派发失败')), 'spawn 失败应有 review-event 留痕')
+// 用户语境 dispatch：失败抛错给发起人（Q8）
+await expectError('REVIEW_SPAWN_FAILED', svcFailSpawn.reviewDispatch([failRes.meeting.docId]))
+ok('spawn 失败韧性（Q2/Q7/Q8）：自动语境静默回滚＋review-event 留痕；用户语境抛错')
+
+// —— Q5-C/Q6：restart 逃生门——废弃旧替身、立即重出审 ——
+const restartDoc = gateFact.meeting.docId // 当前 reviewing
+const restartFact = await svcWithSpawn.reviewRestart(restartDoc)
+assert.equal(restartFact.meeting.review?.state, 'reviewing')
+assert.ok(disposed.includes(restartDoc), 'restart 应废弃旧替身（disposeReviewer）')
+const restartAgain = await svcWithSpawn.reviewRestart(restartDoc) // 逃生门可重复（再次废弃旧替身重出审）
+assert.equal(restartAgain.meeting.review?.state, 'reviewing')
+await expectError('REVIEW_STAGE_BLOCKED', svcWithSpawn.reviewRestart(minReviewProbe.meeting.docId)) // 非审查态（MIN 无 review）拒 restart
+ok('restart 逃生门（Q5/Q6）：reviewing 档案 restart 废弃旧替身并立即重出审，可重复')
+
+// —— Q5-B：替身会话意外销毁兜底——reviewing 无审查意见 → 回滚 filed 重泵 ——
+const disposedDocId = gateFact.meeting.docId // 已归档且泵出审后 reviewing
+const gateState = (await svcWithSpawn.inspect(disposedDocId)).meeting.review?.state
+assert.equal(gateState, 'reviewing')
+// 直接模拟 dispose 兜底（handleStandinDisposed）：无审查意见 → 回滚 filed → 泵重开 reviewing
+await svcWithSpawn.handleStandinDisposed(disposedDocId)
+const afterDisposeFallback = await svcWithSpawn.inspect(disposedDocId)
+assert.equal(afterDisposeFallback.meeting.review?.state, 'reviewing', 'dispose 兜底应回滚并重泵回 reviewing')
+assert.ok(afterDisposeFallback.records.some(record => record.kind === 'review-event' && record.preview.includes('意外销毁')), 'dispose 兜底应有 review-event 留痕')
+ok('dispose 兜底（Q5-B）：reviewing 无审查意见 → 回滚 filed 自动重泵＋留痕')
+
+// —— Q1/Q3：启动恢复（recoverReviews）——重建滞留档案 ——
+// gateFact 此时 reviewing 且无审查意见（dispose 兜底重泵后）→ 启动恢复应回滚并按 priority 重泵.
+const recovery = await svcWithSpawn.recoverReviews()
+assert.ok(recovery.rolledBack.includes(disposedDocId), '启动恢复应回滚滞留 reviewing 档案')
+const recoveredGate = await svcWithSpawn.inspect(disposedDocId)
+assert.equal(recoveredGate.meeting.review?.state, 'reviewing', '启动恢复应把回滚档案重新泵出审')
+ok('启动恢复（Q1/Q3/Q9）：recoverReviews 重建滞留 reviewing 档案')
+
+// —— Q14：修订谱系双向入档 ＋ 审查包注入 ——
+const reviseDoc = gateFact.meeting.docId
+await svcWithSpawn.reviewVerdict('session-reviewer', {
+  docId: reviseDoc,
+  verdict: '建议修订：决议未含回滚阈值参数，建议修订重议',
+  disposal: '处置：建议修订后重议',
+})
+const reviseDecidable = await svcWithSpawn.inspect(reviseDoc)
+assert.equal(reviseDecidable.meeting.review?.state, 'decidable')
+await svcWithSpawn.reviewAdjudicate(LEADER, { docId: reviseDoc, choice: 'revise' })
+// 修订新卷：convene 同类型新会议（RES）
+const revisedFact = await svcWithSpawn.convene(LEADER, { type: 'RES', topic: '修订版', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+const revisedId = revisedFact.meeting.docId
+await svcWithSpawn.reviewLinkLanding(reviseDoc, { revisedDocId: revisedId })
+const revisedView = await svcWithSpawn.inspect(revisedId)
+assert.equal(revisedView.meeting.review?.originDocId, reviseDoc, '新卷应记录修订来源（Q14）')
+assert.ok(revisedView.meeting.review?.sourceReviewNote?.includes('建议修订'), '新卷应记录上轮审查结论摘要（Q14）')
+ok('修订谱系双向入档（Q14）：新卷 originDocId/sourceReviewNote 落板')
+
+// —— Q15：解释性决议同效力同义务——同卷复审再开一轮 ——
+const interpretDoc = resId // resId 已 closed（本轮已闭环）
+const interpretOpen = await svcWithSpawn.reviewRequest(LEADER, { docId: interpretDoc, text: '对「每日全量备份」的解释能否覆盖增量场景？' })
+assert.equal(interpretOpen.meeting.review?.state, 'reviewing') // 二审再开（request 意见落板后 startReview）
+// 二审替身意见（维持）
+await svcWithSpawn.reviewVerdict('session-reviewer', {
+  docId: interpretDoc,
+  verdict: '维持：决议已含增量恢复约束，解释性决议足以覆盖增量场景',
+  disposal: '处置：维持，待用户出口',
+})
+await svcWithSpawn.reviewAdjudicate(LEADER, { docId: interpretDoc, choice: 'interpret' })
+const interpretLinked = await svcWithSpawn.reviewLinkLanding(interpretDoc, { interpretRecordId: 'review:PC-RES:review:主持人#1' })
+assert.equal(interpretLinked.meeting.review?.state, 'reviewing', '解释落地应同卷再开一轮（Q15）：filed 入池后主力档立即泵出审')
+const interpretEvents = (await svcWithSpawn.inspect(interpretDoc)).records
+assert.ok(interpretEvents.some(record => record.kind === 'review-event' && record.preview.includes('再开一轮')), '解释再开轮应有 review-event 留痕')
+ok('解释性决议同效力同义务（Q15）：同卷复审再开一轮＋留痕')
 
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)

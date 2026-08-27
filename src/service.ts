@@ -79,6 +79,17 @@ export interface ReviewSpawner {
    * @param review - 结构化审查包（决议原文/票况/规约核对结果等代码选取字段）.
    */
   spawnReviewer(docId: string, review: Readonly<Record<string, unknown>>): Promise<void>
+  /**
+   * 销毁某案卷的审查替身会话（ADR-0011 Q10-A：交卷/回滚/废弃时服务层调用；
+   * 底座 handle.dispose 幂等，并触发 `agent/disposed`——主动销毁时档案状态
+   * 已离开 reviewing/accepted，5B 兜底条件天然不触发）.
+   * @param docId - 案卷号（spawn 登记表的键）.
+   */
+  disposeReviewer(docId: string): Promise<void>
+  /**
+   * 清理全部替身死会话（ADR-0011 Q10-C：启动扫描调用；进程重启后必然无驱动者）.
+   */
+  disposeAllStandins?(): Promise<void>
 }
 
 /**
@@ -93,6 +104,15 @@ export interface SupervisorSpawner {
    * @param round - 拟计票轮次.
    */
   spawnSupervisor(docId: string, stage: string, round: number): Promise<void>
+  /**
+   * 销毁某案卷的监督替身会话（ADR-0011 Q12：门二窗口关闭/交卷后清理）.
+   * @param docId - 案卷号.
+   */
+  disposeSupervisor?(docId: string): Promise<void>
+  /**
+   * 清理全部监督替身死会话（ADR-0011 Q10-C/Q12）.
+   */
+  disposeAllStandins?(): Promise<void>
 }
 
 /** PandaClaw 服务（插件行 `pandaclaw`）. */
@@ -215,6 +235,8 @@ export class PandaClawService extends Service {
       ...(review?.choice !== undefined ? { choice: review.choice as PcReviewView['choice'] } : {}),
       ...(review?.revisedDocId !== undefined ? { revisedDocId: review.revisedDocId } : {}),
       ...(review?.interpretRecordId !== undefined ? { interpretRecordId: review.interpretRecordId } : {}),
+      ...(review?.originDocId !== undefined ? { originDocId: review.originDocId } : {}),
+      ...(review?.sourceReviewNote !== undefined ? { sourceReviewNote: review.sourceReviewNote } : {}),
       ...(review?.priority !== undefined ? { priority: review.priority } : {}),
     }
   }
@@ -231,6 +253,47 @@ export class PandaClawService extends Service {
       return row
     })
     return view
+  }
+
+  /**
+   * 条件推进复审状态（ADR-0011 Q4-B：CAS）。
+   * predicate 在域存储的原子读改写回调内检查当前状态——谓词不满足则不推进、
+   * 返回 applied=false；并发调用同一档案时只有一个胜出（「只有确实是 filed 才出审」
+   * 成为状态机自带的原子语义）.
+   * @param docId - 文号.
+   * @param predicate - 当前状态谓词（在 update 回调内求值）.
+   * @param mutate - 推进变更（谓词为真时执行）.
+   * @returns 是否实际推进（谓词为假返回 false）.
+   */
+  private async advanceReviewIf(docId: string, predicate: (state: ReviewState) => boolean, mutate: (review: NonNullable<MeetingRow['review']>) => void): Promise<boolean> {
+    const meetings = (await this.domain()).table('meetings')
+    let applied = false
+    await meetings.update(docId, row => {
+      const current: NonNullable<MeetingRow['review']> = row.review ?? { state: 'idle', flag: 'none', count: 0 }
+      if (!predicate(current.state)) return row
+      mutate(current)
+      row.review = current
+      applied = true
+      return row
+    })
+    return applied
+  }
+
+  /** 恢复/失败动作落板为系统事件（ADR-0011 Q7-A：kind='review-event'，authorName='系统'）. */
+  private async recordReviewEvent(docId: string, text: string): Promise<void> {
+    const records = await this.recordsOf(docId)
+    const seq = this.nextSeq(records, record => record.kind === 'review-event')
+    await this.putRecord({
+      id: buildRecordId({ docId, kind: 'review-event', stage: 'review', authorName: '系统', seq }),
+      docId,
+      kind: 'review-event',
+      stage: 'review',
+      seat: 'chair',
+      authorName: '系统',
+      authorSessionId: 'system',
+      text,
+      at: Date.now(),
+    })
   }
 
   /**
@@ -267,6 +330,11 @@ export class PandaClawService extends Service {
       // 规约核对：主线规约是否成立（决议存在/全阶段完成）.
       hasResolution: resolution !== undefined,
       allStagesDone: row.stages.every(stage => stage.state === 'done'),
+      // 修订谱系（Q14-A）：本卷系修订自哪个原卷＋上轮审查结论摘要——审查焦点＝修订是否消除原问题.
+      ...(row.review?.originDocId !== undefined ? { originDocId: row.review.originDocId } : {}),
+      ...(row.review?.sourceReviewNote !== undefined ? { sourceReviewNote: row.review.sourceReviewNote } : {}),
+      // 解释核验（Q15-A）：本卷此前已有解释性决议——核验解释是否与原决议冲突/引入新问题.
+      ...(row.review?.interpretRecordId !== undefined ? { hasInterpretiveResolution: true } : {}),
     }
   }
 
@@ -302,7 +370,7 @@ export class PandaClawService extends Service {
         throw new PcError('REVIEW_UNAVAILABLE', `案卷 ${docId} 未归档，不可出审`)
       }
       if (row.type === 'MIN') continue
-      if (await this.startReview(docId)) dispatched.push(docId)
+      if (await this.startReview(docId, true)) dispatched.push(docId)
     }
     return dispatched
   }
@@ -352,23 +420,19 @@ export class PandaClawService extends Service {
       text: input.text,
       at: Date.now(),
     })
-    // 状态机：idle → filed（登记）→ accepted（受理通过）→ reviewing（派发审查替身）.
+    // 状态机：idle → filed（登记+计数）——受理与派发交给 startReview（CAS/await/回滚统一路径）.
     const flag: ReviewFlag = this.reviewFlagOf(records)
     const priority = reviewPriority(REVIEW_TIERS[row.type], flag)
-    const view = await this.advanceReview(input.docId, review => {
+    await this.advanceReview(input.docId, review => {
       review.state = 'filed'
       review.flag = flag
       review.count = prior.count + 1
       review.priority = priority
-      // 受理检查（机械，零 AI）：有效意见已落板 ⇒ 直接 accepted.
-      review.state = 'accepted'
     })
-    if (this.spawner !== undefined) {
-      const fresh = await this.meetingOrThrow(input.docId)
-      void this.spawner.spawnReviewer(input.docId, await this.buildReviewPackage(fresh))
-    }
-    const done = await this.advanceReview(input.docId, review => { review.state = 'reviewing' })
-    return { pc: 'meeting', meeting: done }
+    // 受理→派发→审查（用户语境：失败抛错给发起人，ADR-0011 Q8-A；意见已落板，回滚后仍留池待重新出审）.
+    await this.startReview(input.docId, true)
+    const done = await this.meetingOrThrow(input.docId)
+    return { pc: 'meeting', meeting: toMeetingView(done) }
   }
 
   /**
@@ -385,33 +449,50 @@ export class PandaClawService extends Service {
   }
 
   /**
-   * 单件出审启动（Q3 泵/专项调用）：filed → accepted → reviewing，并派发审查替身.
+   * 单件出审启动（Q3 泵/专项调用，ADR-0011 Q2/Q4）：filed → accepted → reviewing，
+   * 并 await 派发审查替身（真串行：成功才推进 reviewing）.
    * 对尚未入池的档案（弱/次级档专项开启，review 字段缺省）先初始化入池再启动；
-   * 若 spawner 未装配（测试环境），状态仍推进（流程可测），spawn 缺席由宿主负责.
+   * spawn 失败回滚 filed 留池（自动语境静默，用户语境抛错——ADR-0011 Q8-A）.
    * @param docId - 待出审案卷号.
-   * @returns 是否实际出审（非 reviewing 状态且推进成功）.
+   * @param userInitiated - 用户在场语境（dispatch/request/restart）：失败抛错给发起人.
+   * @returns 是否实际出审（非 filed 且推进成功）.
    */
-  private async startReview(docId: string): Promise<boolean> {
+  private async startReview(docId: string, userInitiated = false): Promise<boolean> {
     const row = await this.meetingOrThrow(docId)
     if (row.review !== undefined && row.review.state !== 'filed') return false
     if (row.review === undefined) {
-      // 尚未入池（用户在场档专项开启）：初始化 filed，flag/priority 按协议计算.
+      // 尚未入池（用户在场档专项开启）：CAS 初始化 filed（谓词=当前 idle），flag/priority 按协议计算.
       const records = await this.recordsOf(docId)
       const flag = this.reviewFlagOf(records)
-      await this.advanceReview(docId, review => {
+      const initialized = await this.advanceReviewIf(docId, state => state === 'idle', review => {
         review.state = 'filed'
         review.flag = flag
         review.count = 0
         review.priority = reviewPriority(REVIEW_TIERS[row.type], flag)
       })
+      if (!initialized) return false
     }
-    await this.advanceReview(docId, review => { review.state = 'accepted' })
+    // filed → accepted（CAS：并发时只有一个胜出）.
+    const accepted = await this.advanceReviewIf(docId, state => state === 'filed', review => { review.state = 'accepted' })
+    if (!accepted) return false
+    // await spawn（真串行：前一个创建完成才继续）.
     if (this.spawner !== undefined) {
-      const fresh = await this.meetingOrThrow(docId)
-      void this.spawner.spawnReviewer(docId, await this.buildReviewPackage(fresh))
+      try {
+        const fresh = await this.meetingOrThrow(docId)
+        await this.spawner.spawnReviewer(docId, await this.buildReviewPackage(fresh))
+      } catch (error) {
+        // 失败回滚 filed 留池 + 系统事件留痕（Q7）；自动语境静默、用户语境抛错（Q8）.
+        await this.advanceReview(docId, review => { review.state = 'filed' })
+        await this.recordReviewEvent(docId, `审查替身派发失败，已回滚待审池：${String(error instanceof Error ? error.message : error)}`)
+        if (userInitiated) {
+          throw new PcError('REVIEW_SPAWN_FAILED', `案卷 ${docId} 出审失败：审查替身未能创建，已回滚待审池，请检查底座装配（pc-reviewer preset）后重试`)
+        }
+        return false
+      }
     }
-    await this.advanceReview(docId, review => { review.state = 'reviewing' })
-    return true
+    // accepted → reviewing（CAS 兜底竞态：理论不可达，静默返回 false）.
+    const reviewing = await this.advanceReviewIf(docId, state => state === 'accepted', review => { review.state = 'reviewing' })
+    return reviewing
   }
 
   /**
@@ -434,6 +515,92 @@ export class PandaClawService extends Service {
       if (await this.startReview(entry.docId)) pumped.push(entry.docId)
     }
     return pumped
+  }
+
+  /**
+   * 启动恢复（ADR-0011 Q1/Q3/Q9/Q10-C/Q11）：服务装配完成后延迟一拍执行一次。
+   * 三步闭环：①清理替身死会话（Q10-C，进程重启后必然无驱动者）；②重建全档位
+   * reviewing/accepted 档案（Q3/Q9：有审查意见→按意见推进，无→回滚 filed 重泵）；
+   * ③泵主力档 filed（含刚回滚出的）。
+   * 全池出审零成功时 loud 报错（Q11：配置错误显式暴露，临时故障仍走静默回滚）.
+   * @returns 泵出与重建详情（供启动日志）.
+   */
+  async recoverReviews(): Promise<{ readonly pumped: readonly string[]; readonly rebuilt: readonly string[]; readonly rolledBack: readonly string[] }> {
+    // Q10-C：清理替身死会话（审查/监督两路，均幂等）.
+    if (this.spawner?.disposeAllStandins !== undefined) await this.spawner.disposeAllStandins()
+    await this.supervisorSpawner?.disposeAllStandins?.()
+    const meetings = (await this.domain()).table('meetings')
+    const rebuilt: string[] = []
+    const rolledBack: string[] = []
+    for (const [, row] of meetings.entries()) {
+      const state = row.review?.state
+      if (state !== 'reviewing' && state !== 'accepted') continue
+      const records = await this.recordsOf(row.docId)
+      const reviewerOpinion = records.some(record =>
+        record.kind === 'review' && record.authorName === '审查主体')
+      if (reviewerOpinion) {
+        // 有审查意见而状态仍在 reviewing/accepted（进程崩溃掉在落板与推进之间）：按意见推进.
+        const dissenting = this.dissentingNames(row, records)
+        await this.advanceReview(row.docId, review => { review.state = dissenting.length > 0 ? 'hearing' : 'decidable' })
+        await this.recordReviewEvent(row.docId, '启动重建：检测到审查意见已落板而状态未推进，已按意见推进'
+          + `（${dissenting.length > 0 ? '沟通纠正（有异议方）' : '决议出口（无异议方）'}）`)
+        rebuilt.push(row.docId)
+      } else {
+        // 无审查意见：替身已死且未产出——回滚 filed 重新泵（Q3）.
+        await this.advanceReview(row.docId, review => { review.state = 'filed' })
+        await this.recordReviewEvent(row.docId, '启动重建：审查替身已死且未产出审查意见，回滚待审池重新出审')
+        rolledBack.push(row.docId)
+      }
+    }
+    const pumped = await this.pumpMainReview()
+    // Q11：池非空而无一出审成功 → loud（配置错误显式暴露）.
+    if (this.spawner !== undefined && pumped.length === 0 && rolledBack.length === 0) {
+      const pending = [...meetings.entries()].filter(([, value]) => value.review?.state === 'filed').length
+      if (pending > 0) {
+        this.ctx.logger.error(`[pandaclaw] 待审池全员出审失败（${pending} 件 filed 未动）：检查审查替身 preset（pc-reviewer）装配与底座 agents 服务`)
+      }
+    }
+    return { pumped, rebuilt, rolledBack }
+  }
+
+  /**
+   * 审查替身会话销毁兜底（ADR-0011 Q5-B）：spawn 成功后替身被 dispose（意外死亡/被杀）
+   * 而档案仍在 reviewing/accepted 且无审查意见 → 回滚 filed 自动重泵。
+   * 主动 dispose（交卷/restart 前状态已离开 reviewing/accepted）天然不触发.
+   * @param docId - 替身所属案卷号（由宿主解析 sessionId 前缀得出）.
+   */
+  async handleStandinDisposed(docId: string): Promise<void> {
+    const row = await this.meetingOrThrow(docId)
+    const state = row.review?.state
+    if (state !== 'reviewing' && state !== 'accepted') return
+    const records = await this.recordsOf(docId)
+    if (records.some(record => record.kind === 'review' && record.authorName === '审查主体')) return
+    await this.advanceReview(docId, review => { review.state = 'filed' })
+    await this.recordReviewEvent(docId, '审查替身会话意外销毁且未产出审查意见，回滚待审池自动重泵')
+    await this.pumpMainReview()
+  }
+
+  /**
+   * 复审重启逃生门（ADR-0011 Q5-C/Q6-A）：用户（主持人授意）废弃当前审查替身的工作，
+   * 立即重开审查——回滚 filed 后当场走完 startReview（不等泵）.
+   * 适用状态仅 reviewing/accepted（hearing 走 close-hearing、decidable 直接 adjudicate、
+   * feedback 直接 reply——各有其道）.
+   * @param docId - 文号.
+   */
+  async reviewRestart(docId: string): Promise<PcFact> {
+    const row = await this.meetingOrThrow(docId)
+    const state = row.review?.state ?? 'idle'
+    if (state !== 'reviewing' && state !== 'accepted') {
+      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${docId} 当前复审状态为 ${state}，不在审查阶段——只有替身未产出审查意见的档案可重启复审（reviewing/accepted）；`
+        + 'hearing 走 close-hearing 收窗、decidable 直接三选、feedback 直接回告')
+    }
+    // 废弃旧替身（Q10-A）：dispose 幂等；spawn 注册表无此档案时静默.
+    if (this.spawner !== undefined) await this.spawner.disposeReviewer(docId)
+    await this.advanceReview(docId, review => { review.state = 'filed' })
+    await this.recordReviewEvent(docId, '用户重启复审：废弃原审查替身工作，重新出审')
+    await this.startReview(docId, true)
+    const fresh = await this.meetingOrThrow(docId)
+    return { pc: 'meeting', meeting: toMeetingView(fresh) }
   }
 
   /**
@@ -481,6 +648,9 @@ export class PandaClawService extends Service {
     const dissenting = this.dissentingNames(row, records)
     const next: ReviewState = dissenting.length > 0 ? 'hearing' : 'decidable'
     const view = await this.advanceReview(input.docId, review => { review.state = next })
+    // 交卷即销毁替身会话（ADR-0011 Q10-A：使命完成，主动 dispose 释放资源；
+    // 此时状态已离开 reviewing/accepted，5B 兜底条件不触发）.
+    if (this.spawner !== undefined) await this.spawner.disposeReviewer(input.docId)
     if (next === 'decidable') {
       // 无异议方：审查意见即呈报用户——由主持人按呈现动作推进（工具侧呈现），这里标记可裁.
     }
@@ -596,7 +766,9 @@ export class PandaClawService extends Service {
   }
 
   /**
-   * 登记复审出口的落地关联（ADR-0010 Q16）：修订→新案卷号；解释→解释性 resolution 记录 id.
+   * 登记复审出口的落地关联（ADR-0010 Q16，ADR-0011 Q14/Q15）：
+   * 修订→新案卷号（对称谱系：新卷记 originDocId＋上轮审查结论摘要）；
+   * 解释→解释性 resolution 记录 id（同效力同义务：同卷复审状态机再开一轮）.
    * 由主持人（用户授意）在 convene 新卷/落解释决议后调用，补全落地关联字段.
    * @param docId - 被复审案卷号.
    * @param input - 关联字段.
@@ -614,7 +786,29 @@ export class PandaClawService extends Service {
       if (input.revisedDocId !== undefined) review.revisedDocId = input.revisedDocId
       if (input.interpretRecordId !== undefined) review.interpretRecordId = input.interpretRecordId
     })
-    return { pc: 'meeting', meeting: view }
+    if (input.revisedDocId !== undefined) {
+      // Q14-A 修订谱系对称：新卷记「修订来源 originDocId＋上轮审查结论摘要」——
+      // 摘要取原卷记录流最新审查主体意见（截断），新卷出审时注入审查包核验焦点.
+      const records = await this.recordsOf(docId)
+      const sourceOpinion = [...records].reverse().find(record =>
+        record.kind === 'review' && record.authorName === '审查主体')
+      const sourceNote = sourceOpinion?.text !== undefined
+        ? sourceOpinion.text.slice(0, 400)
+        : ''
+      await this.advanceReview(input.revisedDocId, review => {
+        review.originDocId = docId
+        review.sourceReviewNote = sourceNote
+      })
+      await this.recordReviewEvent(docId, `复审出口·修订重议：决议关联新卷 ${input.revisedDocId}（谱系已对称入档）`)
+    } else if (input.interpretRecordId !== undefined) {
+      // Q15-A 解释性决议同效力同义务：解释落板即同卷复审状态机再开一轮
+      // （count 累计保留；主力档自动泵/弱档用户在场，出口仍用户三选）.
+      await this.advanceReview(docId, review => { review.state = 'filed' })
+      await this.recordReviewEvent(docId, `复审出口·解释性决议：解释落板（记录 ${input.interpretRecordId}），复审同卷再开一轮（同效力同义务）`)
+      await this.pumpMainReview()
+    }
+    const fresh = await this.meetingOrThrow(docId)
+    return { pc: 'meeting', meeting: toMeetingView(fresh) }
   }
 
   /**
@@ -684,9 +878,10 @@ export class PandaClawService extends Service {
       const verdict = [...records].reverse().find(record =>
         record.kind === 'review' && record.authorName === '审查主体')
       const verdictText = verdict?.text ?? ''
-      // 审查意见含「建议修订/建议解释/修订/解释」→ 实质变更，须逐件三选.
-      if (/建议修订|建议解释|修订重议|解释性/.test(verdictText)) {
-        results.push({ docId, state: current.state, note: '审查意见含修订/解释建议，须逐件三选（不批量化）' })
+      // Q19-A 三分类收敛：仅「维持」可批量——含修订/解释/（旧数据）建议驳回的档案逐件三选
+      // （「建议驳回」旧数据按方向性语义＝建议撤销，批量维持会方向性出错，必须逐件）.
+      if (/建议修订|建议解释|建议驳回|修订重议|解释性/.test(verdictText)) {
+        results.push({ docId, state: current.state, note: '审查意见含修订/解释/驳回建议，须逐件三选（不批量化）' })
         continue
       }
       // 可批量：驳回并说明（先落出口裁定，再进 feedback，由后续回告闭环）.
@@ -1092,11 +1287,16 @@ export class PandaClawService extends Service {
       const hasSupervision = records.some(record =>
         record.kind === 'supervision' && record.stage === activeStage.id && record.round === round)
       if (!hasSupervision) {
-        // Q8-B（ADR-0010 第 9 节）：用户缺席（无 supervision 记录）且计票受阻——
+        // Q8-B（ADR-0010 第 9 节）+ ADR-0011 Q12：用户缺席（无 supervision 记录）且计票受阻——
         // 服务层当场自动派发监督替身（seed 空、setup 硬编码，不经 AI），替身异步
-        // 直写意见后再次计票放行；本人正常回应时永不抢答.
+        // 直写意见后再次计票放行；本人正常回应时永不抢答。await 真串行；
+        // spawn 失败静默＋系统事件留痕（门二继续受阻，重试＝用户代录或再次计票）.
         if (this.supervisorSpawner !== undefined) {
-          void this.supervisorSpawner.spawnSupervisor(docId, activeStage.id, round)
+          try {
+            await this.supervisorSpawner.spawnSupervisor(docId, activeStage.id, round)
+          } catch (error) {
+            await this.recordReviewEvent(docId, `监督替身派发失败（门二受阻时）：${String(error instanceof Error ? error.message : error)}——请代录用户监督意见或明示放弃后重试计票`)
+          }
         }
         throw new PcError('SUPERVISION_PENDING',
           `用户监督窗口未收束（r${round}）：用户在场→代录其监督意见或明示放弃（pc_record kind=supervision）；`
@@ -1148,6 +1348,16 @@ export class PandaClawService extends Service {
     const records = options.terminate === true ? [] : await this.recordsOf(docId)
     if (options.terminate !== true && !records.some(record => record.kind === 'resolution')) {
       throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
+    }
+    // 表决合法性（ADR-0011 Q17-A/Q18-A）：非终止归档须该档表决阶段至少一条 tally——
+    // 「决定必经表决」红线引擎化，无 tally 的决议归档被拦（程序合法性归门禁，实体正确性归复审）.
+    if (options.terminate !== true) {
+      const voteStage = VOTE_STAGES[row.type][0]
+      const tallies = await (async () => [...(await this.domain()).table('tallies').entries()]
+        .map(([, value]) => value).filter(entry => entry.docId === docId && entry.stage === voteStage))()
+      if (tallies.length === 0) {
+        throw new PcError('ADJOURN_BLOCKED', `红线（决定必经表决）：本档表决阶段「${voteStage}」未见任何计票记录（tally）——先以 pc_tally 计票（含征询模式降级计票），再归档`)
+      }
     }
     const meetings = (await this.domain()).table('meetings')
     let fact!: PcFact
@@ -1246,6 +1456,8 @@ function toMeetingView(row: MeetingRow): PcMeetingView {
       ...(review.choice !== undefined ? { choice: review.choice as 'revise' | 'interpret' | 'dismiss' } : {}),
       ...(review.revisedDocId !== undefined ? { revisedDocId: review.revisedDocId } : {}),
       ...(review.interpretRecordId !== undefined ? { interpretRecordId: review.interpretRecordId } : {}),
+      ...(review.originDocId !== undefined ? { originDocId: review.originDocId } : {}),
+      ...(review.sourceReviewNote !== undefined ? { sourceReviewNote: review.sourceReviewNote } : {}),
       ...(review.priority !== undefined ? { priority: review.priority } : {}),
     } } : {}),
     createdAt: row.createdAt,

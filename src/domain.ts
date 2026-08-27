@@ -39,6 +39,10 @@ export const meetingSchema = z.object({
     revisedDocId: z.string().optional(),
     /** 解释出口：原卷追加的解释性 resolution 记录 id. */
     interpretRecordId: z.string().optional(),
+    /** 修订来源（Q14-A）：本卷系修订自哪个原卷（新卷侧谱系，`reviewLinkLanding` 对称落板）. */
+    originDocId: z.string().optional(),
+    /** 修订来源的上轮审查结论摘要（Q14-A：审查焦点＝修订是否消除原问题；注入审查包）. */
+    sourceReviewNote: z.string().optional(),
     /** 待审池出审优先级（服务层机械排序字段）. */
     priority: z.number().optional(),
   }).optional(),

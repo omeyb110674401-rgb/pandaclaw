@@ -435,12 +435,13 @@ export function reviewTool(svc: PandaClawService) {
       + 'action=close-hearing 结束沟通纠正窗口（异议方陈述未齐时的收窗逃生门，程序性）；'
       + 'action=adjudicate 出口三选（choice=revise 修订重议/interpret 解释性决议/dismiss 驳回并说明，note 为驳回说明）——'
       + '审查替身出建议性审查意见后呈用户，最终通过/修订永远由用户决定；'
-      + 'action=batch-dismiss 分级批量驳回（docIds 指定多个待裁案卷，仅审查意见为维持/驳回的统一驳回；含修订/解释建议的自动跳过须逐件）；'
+      + 'action=batch-dismiss 分级批量驳回（docIds 指定多个待裁案卷，仅审查意见为「维持」的统一驳回；含修订/解释/驳回建议的自动跳过须逐件三选）；'
       + 'action=reply 逐条回告（text 处置结论与回告文本，每条意见逐条回执，齐备即闭环）；'
+      + 'action=restart 重启复审（仅替身未产出审查意见的 reviewing/accepted 档案——替身卡死/死亡时废弃原替身立即重出审）；'
       + 'action=link 落地关联——修订后补 revisedDocId（新案卷号），或解释后补 interpretRecordId（原卷解释性 resolution 记录 id）.',
     parameters: {
-      docId: { type: 'string', description: '被复审案卷号（request/close-hearing/adjudicate/reply/link 时必填；dispatch/batch-dismiss 改用 docIds）.' },
-      action: { type: 'string', required: true, enum: ['request', 'dispatch', 'close-hearing', 'adjudicate', 'batch-dismiss', 'reply', 'link'], description: '复审动作.' },
+      docId: { type: 'string', description: '被复审案卷号（request/close-hearing/adjudicate/reply/restart/link 时必填；dispatch/batch-dismiss 改用 docIds）.' },
+      action: { type: 'string', required: true, enum: ['request', 'dispatch', 'close-hearing', 'adjudicate', 'batch-dismiss', 'reply', 'restart', 'link'], description: '复审动作.' },
       docIds: { type: 'string', description: 'dispatch/batch-dismiss 指定的案卷号列表，逗号分隔.' },
       text: { type: 'string', description: 'request=用户复审意见（原汁原味）；reply 语境=回告文本；其他动作忽略.' },
       choice: { type: 'string', enum: ['revise', 'interpret', 'dismiss'], description: 'adjudicate 时的出口三选.' },
@@ -464,7 +465,7 @@ export function reviewTool(svc: PandaClawService) {
       presentationMeta: (_args: unknown, value: PcFact) => value,
     },
     async execute(args: {
-      readonly docId?: string; readonly action: 'request' | 'dispatch' | 'close-hearing' | 'adjudicate' | 'batch-dismiss' | 'reply' | 'link'
+      readonly docId?: string; readonly action: 'request' | 'dispatch' | 'close-hearing' | 'adjudicate' | 'batch-dismiss' | 'reply' | 'restart' | 'link'
       readonly docIds?: string; readonly text?: string; readonly choice?: 'revise' | 'interpret' | 'dismiss'; readonly note?: string
       readonly revisedDocId?: string; readonly interpretRecordId?: string
     }, exec: Exec) {
@@ -511,6 +512,10 @@ export function reviewTool(svc: PandaClawService) {
             if (args.text === undefined || args.text.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '回告必须提供 text（处置结论与回告文本）')
             return await svc.reviewReply(String(exec.agent.id), { docId: args.docId, text: args.text })
           }
+          case 'restart': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'restart 必须提供 docId')
+            return await svc.reviewRestart(args.docId)
+          }
           case 'link': {
             if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'link 必须提供 docId')
             return await svc.reviewLinkLanding(args.docId, {
@@ -531,12 +536,14 @@ export function verdictTool(svc: PandaClawService) {
   return {
     name: 'pc_review_verdict',
     description:
-      `PandaClaw 审查替身专用：依据下发的结构化审查包，对已归档案卷作出审查判断——维持／建议修订／建议解释／建议驳回，`
+      `PandaClaw 审查替身专用：依据下发的结构化审查包，对已归档案卷作出审查判断——维持／建议修订／建议解释（三分类；`
+      + `认为应撤销原决议的并入「建议修订重议」并在处置清单注明「建议废止」，不再产出「建议驳回」——`
+      + `「建议驳回」与用户出口「驳回并说明」语义相反，同词异义已废止）`
       + `并给出逐条处置清单。审查结论是建议性意见（用户三选最终裁量）；`
       + `只依据审查包数据判断，不猜测案卷记录流其他内容。直写服务层，不经主持人代录.`,
     parameters: {
       docId: { type: 'string', required: true, description: '被审查案卷号（来自审查包）.' },
-      verdict: { type: 'string', required: true, description: `审查结论（维持/建议修订/建议解释/建议驳回＋逐条理由，≤${REVIEW_OPINION_LIMIT}字）.'` },
+      verdict: { type: 'string', required: true, description: `审查结论（维持/建议修订/建议解释＋逐条理由，≤${REVIEW_OPINION_LIMIT}字）.'` },
       disposal: { type: 'string', required: true, description: '逐条处置清单（对每条复审意见的处置：采纳/部分采纳/存疑留办/不采纳＋理由）.' },
     },
     output: {

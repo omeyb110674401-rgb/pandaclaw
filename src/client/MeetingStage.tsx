@@ -38,6 +38,7 @@ const KIND_LABELS: Record<string, string> = {
   supervision: '监督意见',
   review: '复审意见',
   'review-reply': '复审回告',
+  'review-event': '系统事件',
 }
 
 /** 复审状态中文标签（ADR-0010 六阶段 ＋ 未进入/已闭环）. */
@@ -386,14 +387,20 @@ function ReviewPanel(props: { readonly meeting: PcMeetingView }): ReturnType<typ
   const stateLabel = REVIEW_STATE_LABELS[state] ?? state
   const inProgress = state !== 'closed'
   const stateColor = state === 'decidable' ? palette.warn : state === 'closed' ? palette.dim : palette.accent
+  // 谱系（ADR-0011 Q14）：修订来源/修订去向/解释关联.
+  const lineageParts: string[] = []
+  if (review?.originDocId !== undefined) lineageParts.push(`修订自 ${review.originDocId}`)
+  if (review?.revisedDocId !== undefined) lineageParts.push(`已由 ${review.revisedDocId} 号修订`)
+  if (review?.interpretRecordId !== undefined) lineageParts.push('含解释性决议（复审同卷再开一轮）')
+  const lineage = lineageParts.length > 0 ? `；${lineageParts.join('；')}` : ''
   const actionText = (() => {
     switch (state) {
       case 'reviewing':
-        return `案卷 ${meeting.docId} 复审审查中（审查替身已派发）；待审查意见落板后呈报用户三选。`
+        return `案卷 ${meeting.docId} 复审审查中（审查替身已派发）；待审查意见落板后呈报用户三选；替身卡死可 restart 重开。`
       case 'hearing':
         return `案卷 ${meeting.docId} 复审沟通纠正中（异议方陈述窗口）；收窗后呈报用户三选。`
       case 'decidable':
-        return `案卷 ${meeting.docId} 复审已出审查意见，请裁定出口三选：修订重议／解释性决议／驳回并说明（pc_review action=adjudicate）；审查意见为维持/驳回的多件待裁档案可直接批量驳回（action=batch-dismiss）。`
+        return `案卷 ${meeting.docId} 复审已出审查意见，请裁定出口三选：修订重议／解释性决议／驳回并说明（pc_review action=adjudicate）；审查意见为维持的多件待裁档案可直接批量驳回（action=batch-dismiss）。`
       case 'feedback':
         return `案卷 ${meeting.docId} 复审出口已裁，逐条回告中（pc_review action=reply，齐备即闭环）。`
       default:
@@ -402,7 +409,7 @@ function ReviewPanel(props: { readonly meeting: PcMeetingView }): ReturnType<typ
   })()
   return h('div', { style: { fontSize: 12, margin: '2px 0 8px' } },
     chip(`复审 · ${stateLabel}（意见 ${String(review?.count ?? 0)} 条）`, inProgress ? stateColor : palette.dim, inProgress),
-    h('span', { style: { color: palette.dim } }, actionText),
+    h('span', { style: { color: palette.dim } }, `${actionText}${lineage}`),
   )
 }
 

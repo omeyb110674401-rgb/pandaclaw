@@ -122,13 +122,17 @@ function equipSessions(ctx: Context, match: (agent: Agent) => boolean, factories
  * @param ctx - 行上下文（inject 列出的服务均已就绪）.
  */
 export function apply(ctx: Context): void {
-  // 服务层 spawn 钩子（ADR-0010 策略一）：审查替身/监督替身一律由宿主机械创建——
-  // seed 空、setup 代码注入，任何 AI 都不生成替身参数.
+  // 服务层 spawn 钩子（ADR-0010 策略一 + ADR-0011 韧性）：审查替身/监督替身一律由
+  // 宿主机械创建——seed 空、setup 代码注入，任何 AI 都不生成替身参数。
+  // 替身 handle 注册表（sessionId→dispose）：Q10-A 交卷/回滚/废弃主动销毁，
+  // Q10-C 启动清理死会话，5B dispose 监听反查案卷号.
+  const reviewerHandles = new Map<string, { readonly docId: string; dispose(): Promise<void> }>()
+  const supervisorHandles = new Map<string, { readonly docId: string; dispose(): Promise<void> }>()
   ctx.plugin(PandaClawService, {
     spawner: {
       async spawnReviewer(docId, review) {
         const sessionId = `subagent-review-${docId}-${shortId()}` as never
-        await ctx.agents.create({
+        const handle = await ctx.agents.create({
           sessionId,
           meta: { origin: 'subagent', agentPreset: REVIEWER_PRESET },
           setup: agentCtx => {
@@ -137,19 +141,33 @@ export function apply(ctx: Context): void {
               name: 'pandaclaw-reviewer-brief',
               order: 10,
               text: '你是 PandaClaw 备案审查复审判卷的审查替身（`pc-reviewer`）。'
-                + '职责：依据下发的结构化审查包，对已归档案卷的决议作出审查判断——维持／建议修订／建议解释／建议驳回，'
+                + '职责：依据下发的结构化审查包，对已归档案卷的决议作出审查判断——'
+                + '维持／建议修订／建议解释（三分类；认为应撤销的决议并入「建议修订重议」并在处置清单注明），'
                 + '并给出逐条处置清单。只审查下发数据，绝不猜测案卷记录流里的其他内容；'
                 + '审查结论是建议性意见，最终由用户三选裁量。完成后调用 pc_review_verdict 直写审查意见（≤600 字）。\n\n'
                 + `【结构化审查包】\n${payload}`,
             })
           },
         })
+        reviewerHandles.set(String(sessionId), { docId, dispose: () => handle.dispose() })
+      },
+      async disposeReviewer(docId) {
+        for (const [sessionId, entry] of reviewerHandles) {
+          if (entry.docId === docId) {
+            reviewerHandles.delete(sessionId)
+            await entry.dispose()
+          }
+        }
+      },
+      async disposeAllStandins() {
+        for (const [, entry] of reviewerHandles) await entry.dispose()
+        reviewerHandles.clear()
       },
     },
     supervisorSpawner: {
       async spawnSupervisor(docId, _stage, _round) {
         const sessionId = `subagent-supervisor-${docId}-${shortId()}` as never
-        await ctx.agents.create({
+        const handle = await ctx.agents.create({
           sessionId,
           meta: { origin: 'subagent', agentPreset: SUPERVISOR_STANDIN_PRESET },
           setup: agentCtx => {
@@ -163,6 +181,19 @@ export function apply(ctx: Context): void {
             })
           },
         })
+        supervisorHandles.set(String(sessionId), { docId, dispose: () => handle.dispose() })
+      },
+      async disposeSupervisor(docId) {
+        for (const [sessionId, entry] of supervisorHandles) {
+          if (entry.docId === docId) {
+            supervisorHandles.delete(sessionId)
+            await entry.dispose()
+          }
+        }
+      },
+      async disposeAllStandins() {
+        for (const [, entry] of supervisorHandles) await entry.dispose()
+        supervisorHandles.clear()
       },
     },
   })
@@ -174,6 +205,23 @@ export function apply(ctx: Context): void {
       'pandaclaw: durable projection unit',
     )
     pc.effect(() => () => { void pc.pandaclaw.dispose() }, 'pandaclaw: domain release')
+    // 5B dispose 兜底（ADR-0011）：监听 agent/disposed——审查替身会话被意外销毁
+    // （非主动 dispose）时反查案卷号并触发服务层回滚重泵；主动 dispose（交卷/restart）
+    // 时档案状态已离开 reviewing/accepted，服务层条件天然不触发.
+    pc.effect(
+      () => {
+        const disposeListener = (payload: { readonly agent: Agent }): void => {
+          const sessionId = String(payload.agent.id)
+          const entry = reviewerHandles.get(sessionId)
+          if (entry === undefined) return
+          reviewerHandles.delete(sessionId)
+          void pc.pandaclaw.handleStandinDisposed(entry.docId).catch(() => undefined)
+        }
+        // ctx.on 返回 disposer（Cordis 惯例：注册是 effect，随作用域释放自动移除）.
+        return ctx.on('agent/disposed', disposeListener as never)
+      },
+      'pandaclaw: reviewer dispose fallback',
+    )
     pc.effect(
       () => equipSessions(pc, leads, leaderFactories()),
       'pandaclaw: leader tools',
@@ -202,6 +250,17 @@ export function apply(ctx: Context): void {
         return preset !== SUPERVISOR_STANDIN_PRESET && preset !== REVIEWER_PRESET
       }, memberFactories()),
       'pandaclaw: member tools',
+    )
+    // 启动恢复（ADR-0011 Q1/Q11）：装配完成后延迟一拍执行（agents/preset 就绪）；
+    // 重建全档位 reviewing/accepted → 泵主力档 filed；全员失败 loud 由服务层负责.
+    pc.effect(
+      () => {
+        const timer = setTimeout(() => {
+          void pc.pandaclaw.recoverReviews().catch(() => undefined)
+        }, 0)
+        return () => { clearTimeout(timer) }
+      },
+      'pandaclaw: startup review recovery',
     )
   })
 }
