@@ -155,9 +155,10 @@ New-Item -ItemType Junction node_modules\@deepseek-ai `
 ## 文档导航
 
 ```
+docs/roadmap.md                       # 后续迭代路线（57 项矩阵 + 版本带 + 完成定义，活文档）
 src/                                  # 插件源码（host + client 双半包）
 pandaclaw-meeting/SKILL.md            # 协议正文 v2.10（含 §0 使用地图）
-docs/adr/                             # 架构裁定 0001–0007
+docs/adr/                             # 架构裁定 0001–0012
 docs/research/                        # 四线制度调研 57 卡
 docs/协议校准底稿.md                   # M1-M17 制度裁决
 docs/演练脚本.md                       # 两场实测记录
