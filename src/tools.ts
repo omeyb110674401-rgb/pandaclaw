@@ -430,20 +430,21 @@ export function reviewTool(svc: PandaClawService) {
     name: 'pc_review',
     description:
       'PandaClaw 复审回告闭环（ADR-0010 备案审查）：对已归档案卷的决议作事后纠错。'
-      + 'action=request 登记用户复审意见（text 原汁原味；主力档 RES/LEG 归档已自动入池出审，次级/弱档需本动作开启）；'
-      + 'action=dispatch 待审池出审调度（按优先级取号派发审查替身）；'
+      + 'action=request 登记用户复审意见（text 原汁原味；次级/弱档 PLA/STR/CON 由此开启，主力档 RES/LEG 归档已自动入池出审）；'
+      + 'action=dispatch 专项出审（docIds 指定一批案卷——含次级/弱档批量开启；主力档已由归档泵自动出审，无需也不可重复）；'
       + 'action=close-hearing 结束沟通纠正窗口（异议方陈述未齐时的收窗逃生门，程序性）；'
       + 'action=adjudicate 出口三选（choice=revise 修订重议/interpret 解释性决议/dismiss 驳回并说明，note 为驳回说明）——'
       + '审查替身出建议性审查意见后呈用户，最终通过/修订永远由用户决定；'
+      + 'action=batch-dismiss 分级批量驳回（docIds 指定多个待裁案卷，仅审查意见为维持/驳回的统一驳回；含修订/解释建议的自动跳过须逐件）；'
       + 'action=reply 逐条回告（text 处置结论与回告文本，每条意见逐条回执，齐备即闭环）；'
       + 'action=link 落地关联——修订后补 revisedDocId（新案卷号），或解释后补 interpretRecordId（原卷解释性 resolution 记录 id）.',
     parameters: {
-      docId: { type: 'string', required: true, description: '被复审案卷号（须已归档）.' },
-      action: { type: 'string', required: true, enum: ['request', 'dispatch', 'close-hearing', 'adjudicate', 'reply', 'link'], description: '复审动作.' },
+      docId: { type: 'string', description: '被复审案卷号（request/close-hearing/adjudicate/reply/link 时必填；dispatch/batch-dismiss 改用 docIds）.' },
+      action: { type: 'string', required: true, enum: ['request', 'dispatch', 'close-hearing', 'adjudicate', 'batch-dismiss', 'reply', 'link'], description: '复审动作.' },
+      docIds: { type: 'string', description: 'dispatch/batch-dismiss 指定的案卷号列表，逗号分隔.' },
       text: { type: 'string', description: 'request=用户复审意见（原汁原味）；reply 语境=回告文本；其他动作忽略.' },
       choice: { type: 'string', enum: ['revise', 'interpret', 'dismiss'], description: 'adjudicate 时的出口三选.' },
-      note: { type: 'string', description: 'adjudicate 时驳回说明（dismiss 建议填，revise/interpret 可空）.' },
-      limit: { type: 'number', description: 'dispatch 时最多出审条数（缺省 1）.' },
+      note: { type: 'string', description: 'adjudicate 时驳回说明；batch-dismiss 时统一驳回说明模板（缺省用标准说明）.' },
       revisedDocId: { type: 'string', description: 'link 时修订出口的新案卷号.' },
       interpretRecordId: { type: 'string', description: 'link 时解释出口的 resolution 记录 id.' },
     },
@@ -463,40 +464,60 @@ export function reviewTool(svc: PandaClawService) {
       presentationMeta: (_args: unknown, value: PcFact) => value,
     },
     async execute(args: {
-      readonly docId: string; readonly action: 'request' | 'dispatch' | 'close-hearing' | 'adjudicate' | 'reply' | 'link'
-      readonly text?: string; readonly choice?: 'revise' | 'interpret' | 'dismiss'; readonly note?: string
-      readonly limit?: number; readonly revisedDocId?: string; readonly interpretRecordId?: string
+      readonly docId?: string; readonly action: 'request' | 'dispatch' | 'close-hearing' | 'adjudicate' | 'batch-dismiss' | 'reply' | 'link'
+      readonly docIds?: string; readonly text?: string; readonly choice?: 'revise' | 'interpret' | 'dismiss'; readonly note?: string
+      readonly revisedDocId?: string; readonly interpretRecordId?: string
     }, exec: Exec) {
       try {
+        const splitIds = (raw: string): string[] => raw.split(/[,，、]/).map(id => id.trim()).filter(id => id.length > 0)
         switch (args.action) {
           case 'request': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'request 必须提供 docId')
             if (args.text === undefined || args.text.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '登记复审意见必须提供 text（原汁原味不改写）')
             return await svc.reviewRequest(String(exec.agent.id), { docId: args.docId, text: args.text })
           }
           case 'dispatch': {
-            const dispatched = await svc.reviewDispatch(args.limit ?? 1)
-            if (dispatched.length === 0) {
-              throw new PcError('REVIEW_STAGE_BLOCKED', '待审池当前无可出审案卷（无 filed 状态的主力档归档案卷）')
-            }
+            if (args.docIds === undefined || args.docIds.trim().length === 0) throw new PcError('REVIEW_STAGE_BLOCKED', '专项出审必须提供 docIds（指定本批案卷）')
+            const dispatched = await svc.reviewDispatch(splitIds(args.docIds))
+            if (dispatched.length === 0) throw new PcError('REVIEW_STAGE_BLOCKED', '指定案卷均不在待审池（filed 状态）：主力档归档已自动出审，次级/弱档请确认状态')
             return { pc: 'meeting' as const, meeting: (await svc.inspect(dispatched[0])).meeting }
           }
-          case 'close-hearing':
+          case 'close-hearing': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'close-hearing 必须提供 docId')
             return await svc.reviewCloseHearing(args.docId)
+          }
           case 'adjudicate': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'adjudicate 必须提供 docId')
             if (args.choice === undefined) throw new PcError('REVIEW_CHOICE_INVALID', 'adjudicate 必须提供 choice（revise/interpret/dismiss）')
             return await svc.reviewAdjudicate(String(exec.agent.id), {
               docId: args.docId, choice: args.choice, ...(args.note !== undefined ? { note: args.note } : {}),
             })
           }
+          case 'batch-dismiss': {
+            if (args.docIds === undefined || args.docIds.trim().length === 0) throw new PcError('REVIEW_STAGE_BLOCKED', '批量驳回必须提供 docIds')
+            const results = await svc.reviewBatchDismiss(String(exec.agent.id), {
+              docIds: splitIds(args.docIds),
+              ...(args.note !== undefined ? { note: args.note } : {}),
+            })
+            const first = results.find(result => result.state === 'feedback')
+            if (first === undefined) {
+              const skipped = results.map(result => result.docId).join('、')
+              throw new PcError('REVIEW_STAGE_BLOCKED', `批量驳回无成功项：${skipped}（含修订/解释建议或非待裁状态，须逐件处理）`)
+            }
+            return { pc: 'meeting' as const, meeting: (await svc.inspect(first.docId)).meeting }
+          }
           case 'reply': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'reply 必须提供 docId')
             if (args.text === undefined || args.text.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '回告必须提供 text（处置结论与回告文本）')
             return await svc.reviewReply(String(exec.agent.id), { docId: args.docId, text: args.text })
           }
-          case 'link':
+          case 'link': {
+            if (args.docId === undefined) throw new PcError('STRUCTURE_FAIL', 'link 必须提供 docId')
             return await svc.reviewLinkLanding(args.docId, {
               ...(args.revisedDocId !== undefined ? { revisedDocId: args.revisedDocId } : {}),
               ...(args.interpretRecordId !== undefined ? { interpretRecordId: args.interpretRecordId } : {}),
             })
+          }
         }
       } catch (error) {
         translate(error)

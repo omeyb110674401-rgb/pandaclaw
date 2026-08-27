@@ -246,12 +246,15 @@ export class PandaClawService extends Service {
         .map(([, value]) => value).filter(entry => entry.docId === row.docId))(),
     ])
     const resolution = records.find(record => record.kind === 'resolution')
+    const flag = this.reviewFlagOf(records)
     return {
       docId: row.docId,
       type: row.type,
       validation: row.validation,
       topic: row.topic,
       status: row.status,
+      // 降级标记（Q4：唯一 consultive=征询采信）：审查替身识别「留了尾巴」的档案，重点核验采信是否合理.
+      reviewFlag: flag,
       resolutionText: resolution?.text ?? '',
       // 票况只取结构化字段（不含选票理由原文）.
       tallies: tallies.map(tally => ({
@@ -281,35 +284,25 @@ export class PandaClawService extends Service {
   // —— 复审回告闭环（ADR-0010）：公开方法 ——
 
   /**
-   * 待审池出审调度（ADR-0010 Q15/Q17：有备必审分层，零 AI 判断）.
-   * 从待审池中按优先级（主力先于次级/弱档，同档降级标记优先）取出并推进
-   * filed → accepted → reviewing，派发审查替身。可由宿主在归档后调用，
-   * 也可作为服务方法供主持人（用户授意）批处理.
-   * @param limit - 最多处理条数（缺省 1）.
-   * @returns 本次出审的案卷号列表.
+   * 待审池专项出审（ADR-0010 Q1″/Q2：手动窗口）.
+   * 用户明确指定一批案卷（`docIds`）出审——可含任意档位（次级/弱档因此可由
+   * 用户在场批量开启）；主力档已由归档位点批量泵自动出审，无需也不会被本方法
+   * 重复启动（其状态已非 filed）。
+   * @param docIds - 用户指定的案卷号列表（专项批次的唯一依据，必填非空）.
+   * @returns 实际出审的案卷号列表.
    */
-  async reviewDispatch(limit = 1): Promise<readonly string[]> {
-    const meetings = (await this.domain()).table('meetings')
-    const pool: { readonly docId: string; readonly priority: number }[] = []
-    for (const [, value] of meetings.entries()) {
-      if (value.review?.state === 'filed') {
-        pool.push({ docId: value.docId, priority: value.review.priority ?? 99 })
-      }
+  async reviewDispatch(docIds: readonly string[]): Promise<readonly string[]> {
+    if (docIds.length === 0) {
+      throw new PcError('REVIEW_STAGE_BLOCKED', '专项出审必须指定案卷（docIds）：要审哪些档案由用户明确点名')
     }
-    pool.sort((a, b) => a.priority - b.priority)
-    const chosen = pool.slice(0, Math.max(1, limit))
     const dispatched: string[] = []
-    for (const entry of chosen) {
-      const row = await this.meetingOrThrow(entry.docId)
-      if (row.review?.state !== 'filed') continue
-      await this.advanceReview(entry.docId, review => { review.state = 'accepted' })
-      if (this.spawner !== undefined) {
-        const fresh = await this.meetingOrThrow(entry.docId)
-        void this.spawner.spawnReviewer(entry.docId, await this.buildReviewPackage(fresh))
+    for (const docId of docIds) {
+      const row = await this.meetingOrThrow(docId)
+      if (row.status !== 'adjourned') {
+        throw new PcError('REVIEW_UNAVAILABLE', `案卷 ${docId} 未归档，不可出审`)
       }
-      const done = await this.advanceReview(entry.docId, review => { review.state = 'reviewing' })
-      void done
-      dispatched.push(entry.docId)
+      if (row.type === 'MIN') continue
+      if (await this.startReview(docId)) dispatched.push(docId)
     }
     return dispatched
   }
@@ -360,7 +353,7 @@ export class PandaClawService extends Service {
       at: Date.now(),
     })
     // 状态机：idle → filed（登记）→ accepted（受理通过）→ reviewing（派发审查替身）.
-    const flag: ReviewFlag = this.reviewFlagOf(row, records)
+    const flag: ReviewFlag = this.reviewFlagOf(records)
     const priority = reviewPriority(REVIEW_TIERS[row.type], flag)
     const view = await this.advanceReview(input.docId, review => {
       review.state = 'filed'
@@ -378,13 +371,69 @@ export class PandaClawService extends Service {
     return { pc: 'meeting', meeting: done }
   }
 
-  /** 从会议行与记录推导协议降级标记（ADR-0010）：征询采信（决议文本标注）/ 验收 skip. */
-  private reviewFlagOf(row: MeetingRow, records: readonly RecordRow[]): ReviewFlag {
+  /**
+   * 从记录推导协议降级标记（ADR-0010 Q4 修正）.
+   * 降级态唯一＝征询采信（`consultive`）：应答率不足却由用户三选采信归档，
+   * ADR-0004 明文标注「未达法定状态」——真正「协议盖章放行但留了尾巴」.
+   * 验收 skip 不是降级态（RES 默认档的正常产物，非异常；其检验由自动复审覆盖），
+   * 不再产出 `skip-validation`（旧数据兼容由类型保留）.
+   */
+  private reviewFlagOf(records: readonly RecordRow[]): ReviewFlag {
     const consultive = records.some(record =>
       record.kind === 'resolution' && /征询采信|未达法定状态/.test(record.text))
-    if (consultive) return 'consultive'
-    if (row.validation === 'skip') return 'skip-validation'
-    return 'none'
+    return consultive ? 'consultive' : 'none'
+  }
+
+  /**
+   * 单件出审启动（Q3 泵/专项调用）：filed → accepted → reviewing，并派发审查替身.
+   * 对尚未入池的档案（弱/次级档专项开启，review 字段缺省）先初始化入池再启动；
+   * 若 spawner 未装配（测试环境），状态仍推进（流程可测），spawn 缺席由宿主负责.
+   * @param docId - 待出审案卷号.
+   * @returns 是否实际出审（非 reviewing 状态且推进成功）.
+   */
+  private async startReview(docId: string): Promise<boolean> {
+    const row = await this.meetingOrThrow(docId)
+    if (row.review !== undefined && row.review.state !== 'filed') return false
+    if (row.review === undefined) {
+      // 尚未入池（用户在场档专项开启）：初始化 filed，flag/priority 按协议计算.
+      const records = await this.recordsOf(docId)
+      const flag = this.reviewFlagOf(records)
+      await this.advanceReview(docId, review => {
+        review.state = 'filed'
+        review.flag = flag
+        review.count = 0
+        review.priority = reviewPriority(REVIEW_TIERS[row.type], flag)
+      })
+    }
+    await this.advanceReview(docId, review => { review.state = 'accepted' })
+    if (this.spawner !== undefined) {
+      const fresh = await this.meetingOrThrow(docId)
+      void this.spawner.spawnReviewer(docId, await this.buildReviewPackage(fresh))
+    }
+    await this.advanceReview(docId, review => { review.state = 'reviewing' })
+    return true
+  }
+
+  /**
+   * 归档位点批量泵（Q3-B）：扫描待审池中全部**主力档**（RES/LEG）filed 案卷，
+   * 按 priority 排序（征询采信优先）逐个 spawn 审查替身（串行：前一个创建完成
+   * 才创建下一个）；用户在场档（次级/弱）不在泵内，留在池里等用户 request/专项.
+   * @returns 本次泵出的案卷号列表.
+   */
+  private async pumpMainReview(): Promise<readonly string[]> {
+    const meetings = (await this.domain()).table('meetings')
+    const pool: { readonly docId: string; readonly priority: number }[] = []
+    for (const [, value] of meetings.entries()) {
+      if (value.review?.state === 'filed' && REVIEW_TIERS[value.type] === 'main') {
+        pool.push({ docId: value.docId, priority: value.review.priority ?? 99 })
+      }
+    }
+    pool.sort((a, b) => a.priority - b.priority)
+    const pumped: string[] = []
+    for (const entry of pool) {
+      if (await this.startReview(entry.docId)) pumped.push(entry.docId)
+    }
+    return pumped
   }
 
   /**
@@ -604,6 +653,47 @@ export class PandaClawService extends Service {
     const next: ReviewState = replies >= target ? 'closed' : 'feedback'
     const view = await this.advanceReview(input.docId, review => { review.state = next })
     return { pc: 'meeting', meeting: view }
+  }
+
+  /**
+   * 分级批量驳回（ADR-0010 Q5-A）：对审查意见为「建议维持/建议驳回」的 decidable
+   * 档案一键批量驳回（驳回=认可维持原决议，出口仍需用户决定但可批量确认）；
+   * 「建议修订/建议解释」的档案必须逐件三选（实质变更不批量化）.
+   * @param actorSessionId - 用户/主持人会话 id（审计字段）.
+   * @param docIds - 待批量驳回的案卷号列表（须均为 decidable 且审查意见可批量）.
+   * @param note - 统一的驳回说明模板（每条回告均携带；缺省用标准说明）.
+   * @returns 各案卷的处理结果（成功驳回或跳过原因）.
+   */
+  async reviewBatchDismiss(actorSessionId: string, input: {
+    readonly docIds: readonly string[]
+    readonly note?: string
+  }): Promise<ReadonlyArray<{ readonly docId: string; readonly state: ReviewState; readonly note?: string }>> {
+    if (input.docIds.length === 0) {
+      throw new PcError('REVIEW_STAGE_BLOCKED', '批量驳回必须指定至少一个案卷（docIds）')
+    }
+    const defaultNote = input.note ?? '批量复审处置：经审查维持原决议，未见需修订事项；逐条处置清单已随审查意见入档。'
+    const results: Array<{ readonly docId: string; readonly state: ReviewState; readonly note?: string }> = []
+    for (const docId of input.docIds) {
+      const row = await this.meetingOrThrow(docId)
+      const current = this.reviewOf(row)
+      if (current.state !== 'decidable') {
+        results.push({ docId, state: current.state, note: `非待裁状态（${current.state}），跳过` })
+        continue
+      }
+      const records = await this.recordsOf(docId)
+      const verdict = [...records].reverse().find(record =>
+        record.kind === 'review' && record.authorName === '审查主体')
+      const verdictText = verdict?.text ?? ''
+      // 审查意见含「建议修订/建议解释/修订/解释」→ 实质变更，须逐件三选.
+      if (/建议修订|建议解释|修订重议|解释性/.test(verdictText)) {
+        results.push({ docId, state: current.state, note: '审查意见含修订/解释建议，须逐件三选（不批量化）' })
+        continue
+      }
+      // 可批量：驳回并说明（先落出口裁定，再进 feedback，由后续回告闭环）.
+      await this.reviewAdjudicate(actorSessionId, { docId, choice: 'dismiss', note: defaultNote })
+      results.push({ docId, state: 'feedback', note: defaultNote })
+    }
+    return results
   }
 
   // —— 主持人操作 ——
@@ -1054,11 +1144,10 @@ export class PandaClawService extends Service {
   async adjourn(docId: string, options: { readonly terminate?: boolean; readonly reason?: string } = {}): Promise<PcFact> {
     const row = await this.meetingOrThrow(docId)
     this.assertOpen(row)
-    if (options.terminate !== true) {
-      const records = await this.recordsOf(docId)
-      if (!records.some(record => record.kind === 'resolution')) {
-        throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
-      }
+    // 归档前取一次记录：非终止需要 resolution 锚点校验；入池的降级标记也要读决议文本.
+    const records = options.terminate === true ? [] : await this.recordsOf(docId)
+    if (options.terminate !== true && !records.some(record => record.kind === 'resolution')) {
+      throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
     }
     const meetings = (await this.domain()).table('meetings')
     let fact!: PcFact
@@ -1080,10 +1169,10 @@ export class PandaClawService extends Service {
       }
       current.status = 'adjourned'
       current.closedAt = Date.now()
-      // 有备必审入池（ADR-0010 Q17）：主力档（RES/LEG）归档即自动进入复审待审池——
-      // 状态置 filed（登记位点），由后续出审调度推进到 accepted/reviewing.
+      // 有备必审入池（ADR-0010 Q3/Q4）：主力档（RES/LEG）归档即自动进入复审待审池——
+      // 状态置 filed，由归档位点的批量泵按优先级逐个出审；降级标记唯一=征询采信（Q4）.
       if (REVIEW_TIERS[current.type] === 'main' && current.review === undefined) {
-        const flag: ReviewFlag = current.validation === 'skip' ? 'skip-validation' : 'none'
+        const flag = this.reviewFlagOf(records)
         current.review = {
           state: 'filed',
           flag,
@@ -1094,6 +1183,11 @@ export class PandaClawService extends Service {
       fact = { pc: 'meeting', meeting: toMeetingView(current) }
       return current
     })
+    // 归档位点批量泵（Q3-B）：把池中全部主力档 filed 按 priority 排序逐个 spawn 审查替身
+    // （含刚归档的这篇）；泵只处理主力档，用户在场档（次级/弱）留在池里等用户.
+    if (REVIEW_TIERS[(await this.meetingOrThrow(docId)).type] === 'main') {
+      await this.pumpMainReview()
+    }
     return fact
   }
 

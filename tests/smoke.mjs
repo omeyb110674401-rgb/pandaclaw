@@ -326,10 +326,13 @@ await svc.chairRecord(LEADER, { docId: resId, kind: 'resolution', text: '决议�
 await svc.stage(resId, 'advance') // → publish（末段）
 const resAdjourned = await svc.adjourn(resId)
 assert.equal(resAdjourned.meeting.status, 'adjourned')
-// 主力档（RES）归档自动入池：review 状态应为 filed（有备必审，skip 档带降级标记）
+// 主力档（RES）归档自动入池＋归档泵自动出审（Q3-B）：返回快照仍为 filed（入池登记），
+// 但泵已当场推进到 reviewing（spawn 审查替身）；flag 无降级标记（skip 非降级，Q4）.
 assert.equal(resAdjourned.meeting.review?.state, 'filed')
-assert.equal(resAdjourned.meeting.review?.flag, 'skip-validation')
-ok('有备必审（ADR-0010 Q17）：RES 主力档归档即自动入池（filed+降级标记）')
+assert.equal(resAdjourned.meeting.review?.flag, 'none')
+const resAfterPump = await svc.inspect(resId)
+assert.equal(resAfterPump.meeting.review?.state, 'reviewing')
+ok('有备必审＋归档泵（ADR-0010 Q3/Q4）：RES 主力档归档自动入池、泵当场出审至 reviewing，skip 非降级态')
 
 // —— 未归档不可复审 / MIN 不可复审 ——
 await expectError('REVIEW_UNAVAILABLE', svc.reviewRequest(LEADER, { docId: con3Id, text: 'X' })) // con3 未归档
@@ -344,17 +347,40 @@ await svc.adjourn(minReviewProbe.meeting.docId)
 await expectError('REVIEW_UNAVAILABLE', svc.reviewRequest(LEADER, { docId: minReviewProbe.meeting.docId, text: '审纪要' }))
 ok('复审门槛：未归档拒审 / MIN 不产生新决定拒审')
 
-// —— 出审调度派发审查替身（桩捕获 spawn 参数）——
+// —— 归档泵自动 spawn 审查替身（Q3-B：桩捕获 spawn 参数；泵只在归档位点处理主力档）——
 const spawned = []
-const svcWithSpawn = new PandaClawService(ctx, { spawner: { spawnReviewer: async (docId, review) => { spawned.push({ docId, hasResolution: review.hasResolution }) } } })
-const dispatched = await svcWithSpawn.reviewDispatch(1)
-assert.ok(dispatched.includes(resId), `出审应包含 ${resId}`)
-assert.equal(spawned.length, 1)
-assert.equal(spawned[0].hasResolution, true)
-// 派发后状态：filed → accepted → reviewing
+const svcWithSpawn = new PandaClawService(ctx, { spawner: { spawnReviewer: async (docId, review) => { spawned.push({ docId, hasResolution: review.hasResolution, reviewFlag: review.reviewFlag }) } } })
+// resId 已在 svc.adjourn 时被泵推进到 reviewing（svc 无 spawner 故无 spawn）；验证状态已是 reviewing.
 const reviewing = await svcWithSpawn.inspect(resId)
 assert.equal(reviewing.meeting.review?.state, 'reviewing')
-ok('出审调度（Q15）：按优先级取号派发审查替身，structured 审查包含决议锚点')
+// 泵已处理过 resId（归档时 filed→reviewing），不再重复 spawn.
+assert.equal(spawned.length, 0)
+// —— 专项 dispatch（Q1″/Q2 手动窗口）：docIds 指定弱档批量开启 ——
+const con4Fact = await svc.convene(LEADER, {
+  type: 'CON', topic: '审计接入规范', tier: 'simple',
+  cppccNames: ['架构师', '安全工程师'], npcNames: ['代表A'],
+})
+const con4Id = con4Fact.meeting.docId
+for (let i = 0; i < 4; i++) await svc.stage(con4Id, 'advance') // 立项→调研→起草→征求意见→审议(⭐r1)
+await svc.submit('session-cppcc-a', { docId: con4Id, name: '架构师', kind: 'opinion', text: goodOpinion })
+await svc.submit(NPC_A, { docId: con4Id, name: '代表A', kind: 'inquiry', text: '审计接入的最小日志面？' })
+await svc.vote(NPC_A, { docId: con4Id, name: '代表A', stance: '赞成', reason: '必要' })
+await svc.chairRecord(LEADER, { docId: con4Id, kind: 'warning', text: '预告' })
+await svc.chairRecord(LEADER, { docId: con4Id, kind: 'supervision', text: '代录·用户：无需监督' })
+await svc.tally(con4Id) // consultive（应答 1/2）
+await svc.chairRecord(LEADER, { docId: con4Id, kind: 'resolution', text: '决议（征询采信·未达法定状态）：采纳审计接入规范；应答 1/2 未达标。' })
+await svc.stage(con4Id, 'advance') // → 发布（末段）
+await svc.adjourn(con4Id)
+// CON 是弱档：归档不入池（review 未创建），用户在场专项 dispatch 批量开启.
+const dispatched = await svcWithSpawn.reviewDispatch([con4Id])
+assert.deepEqual(dispatched, [con4Id])
+assert.equal(spawned.length, 1)
+assert.equal(spawned[0].docId, con4Id)
+assert.equal(spawned[0].hasResolution, true)
+assert.equal(spawned[0].reviewFlag, 'consultive') // 征询采信标记注入审查包（Q4）
+const con4After = await svcWithSpawn.inspect(con4Id)
+assert.equal(con4After.meeting.review?.state, 'reviewing')
+ok('归档泵＋专项 dispatch（Q2/Q3/Q4）：主力档归档泵自动出审；弱档用户在场 docIds 专项开启，征询采信标记进审查包')
 
 // —— 审查替身直写审查意见 → 无异议方进 decidable ——
 // 反例：未进入审查阶段的案卷（MIN idle）拒绝替身直写
@@ -379,29 +405,45 @@ assert.equal(replied.meeting.review?.state, 'closed')
 assert.equal(replied.meeting.review?.count, 0)
 ok('出口三选＋逐条回告（Q10/Q16/Q5-C）：dismiss → feedback → 回告齐备 → closed')
 
-// —— 弱档（CON）用户通道：revision 出口走新卷关联 ——
-const con4Fact = await svc.convene(LEADER, {
-  type: 'CON', topic: '审计接入规范', tier: 'simple',
-  cppccNames: ['架构师', '安全工程师'], npcNames: ['代表A'],
+// —— 分级批量驳回（Q5-A）——con4 已 decidable：批量驳回它 + res2（含修订建议应跳过）——
+const con4Verdict = await svcWithSpawn.reviewVerdict('session-reviewer', {
+  docId: con4Id,
+  verdict: '维持：审计接入规范与风险面相符，采信合理（征询采信核验通过）',
+  disposal: '意见处置：经核验征询采信合理，维持归档',
 })
-const con4Id = con4Fact.meeting.docId
-// 快速归档（走 consultive 征询采信，制造降级标记）
-for (let i = 0; i < 4; i++) await svc.stage(con4Id, 'advance') // 立项→调研→起草→征求意见→审议(⭐r1)
-await svc.submit('session-cppcc-a', { docId: con4Id, name: '架构师', kind: 'opinion', text: goodOpinion })
-await svc.submit(NPC_A, { docId: con4Id, name: '代表A', kind: 'inquiry', text: '审计接入的最小日志面？' })
-await svc.vote(NPC_A, { docId: con4Id, name: '代表A', stance: '赞成', reason: '必要' })
-await svc.chairRecord(LEADER, { docId: con4Id, kind: 'warning', text: '预告' })
-await svc.chairRecord(LEADER, { docId: con4Id, kind: 'supervision', text: '代录·用户：无需监督' })
-await svc.tally(con4Id) // consultive（应答 1/2）
-await svc.chairRecord(LEADER, { docId: con4Id, kind: 'resolution', text: '决议（征询采信·未达法定状态）：采纳审计接入规范；应答 1/2 未达标。' })
-await svc.stage(con4Id, 'advance') // → 发布（末段）
-await svc.adjourn(con4Id)
-// CON 是弱档：归档不入池（无 filed），用户提意见显式开启
-const con4Review = await svcWithSpawn.reviewRequest(LEADER, { docId: con4Id, text: '审计接入应覆盖所有敏感数据面，现行规范遗漏导出接口。' })
-assert.equal(con4Review.meeting.review?.state, 'reviewing') // request 内部走完 filed→accepted→reviewing
-ok('弱档用户通道（Q17）：CON 归档不入池，用户提意见即开启复审')
+assert.equal(con4Verdict.meeting.review?.state, 'decidable')
+// 造一件「建议修订」的 decidable 档案验证跳过（复用 res2：RES 归档→泵出审→审查意见建议修订）
+const res2Fact = await svcWithSpawn.convene(LEADER, { type: 'RES', topic: 'x2', tier: 'simple', cppccNames: ['a', 'b'], npcNames: ['c'] })
+await svcWithSpawn.stage(res2Fact.meeting.docId, 'advance')
+await svcWithSpawn.stage(res2Fact.meeting.docId, 'advance')
+await svcWithSpawn.submit('session-cppcc-a', { docId: res2Fact.meeting.docId, name: 'a', kind: 'opinion', text: goodOpinion })
+await svcWithSpawn.submit(NPC_A, { docId: res2Fact.meeting.docId, name: 'c', kind: 'inquiry', text: 'RTO 目标？' })
+await svcWithSpawn.vote(NPC_A, { docId: res2Fact.meeting.docId, name: 'c', stance: '赞成', reason: '同意' })
+await svcWithSpawn.chairRecord(LEADER, { docId: res2Fact.meeting.docId, kind: 'warning', text: '预告' })
+await svcWithSpawn.chairRecord(LEADER, { docId: res2Fact.meeting.docId, kind: 'supervision', text: '无需监督' })
+await svcWithSpawn.tally(res2Fact.meeting.docId)
+await svcWithSpawn.chairRecord(LEADER, { docId: res2Fact.meeting.docId, kind: 'resolution', text: '决议：RTO 8 小时。' })
+await svcWithSpawn.stage(res2Fact.meeting.docId, 'advance')
+await svcWithSpawn.adjourn(res2Fact.meeting.docId) // 归档泵自动出审 res2
+await svcWithSpawn.reviewVerdict('session-reviewer', {
+  docId: res2Fact.meeting.docId,
+  verdict: '建议修订：RTO 8 小时超出业务可接受范围，建议压缩至 4 小时',
+  disposal: '处置：建议修订后重议',
+})
+assert.equal((await svcWithSpawn.inspect(res2Fact.meeting.docId)).meeting.review?.state, 'decidable')
+// 批量驳回 [con4Id, res2]：con4 成功（维持），res2 因修订建议被跳过.
+const batch = await svcWithSpawn.reviewBatchDismiss(LEADER, { docIds: [con4Id, res2Fact.meeting.docId] })
+const con4Batch = batch.find(item => item.docId === con4Id)
+assert.equal(con4Batch?.state, 'feedback')
+const res2Batch = batch.find(item => item.docId === res2Fact.meeting.docId)
+assert.equal(res2Batch?.state, 'decidable')
+assert.ok(res2Batch?.note?.includes('逐件'), '修订建议档案应提示逐件三选')
+ok('分级批量驳回（Q5-A）：维持/驳回意见可批量；含修订建议的须逐件三选')
 
-// —— 复审意见防重 / 进程闭环后再开 ——
-await expectError('REVIEW_STAGE_BLOCKED', svcWithSpawn.reviewRequest(LEADER, { docId: con4Id, text: '重复开启' }))
+// —— 回告闭环：con4 一条回告闭环（专项开启无人工意见，count=0）——
+const con4Replied = await svcWithSpawn.reviewReply(LEADER, { docId: con4Id, text: '回告：征询采信经核验维持，另行驳回复审意见如上。' })
+assert.equal(con4Replied.meeting.review?.state, 'closed')
+assert.equal(con4Replied.meeting.review?.count, 0)
+ok('逐条回告闭环（Q5-C）：批量驳回后按条回告即闭环')
 
 console.log(`\n✅ 冒烟全部通过：${passed} 项断言组`)

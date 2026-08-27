@@ -393,7 +393,7 @@ function ReviewPanel(props: { readonly meeting: PcMeetingView }): ReturnType<typ
       case 'hearing':
         return `案卷 ${meeting.docId} 复审沟通纠正中（异议方陈述窗口）；收窗后呈报用户三选。`
       case 'decidable':
-        return `案卷 ${meeting.docId} 复审已出审查意见，请裁定出口三选：修订重议／解释性决议／驳回并说明（pc_review action=adjudicate）。`
+        return `案卷 ${meeting.docId} 复审已出审查意见，请裁定出口三选：修订重议／解释性决议／驳回并说明（pc_review action=adjudicate）；审查意见为维持/驳回的多件待裁档案可直接批量驳回（action=batch-dismiss）。`
       case 'feedback':
         return `案卷 ${meeting.docId} 复审出口已裁，逐条回告中（pc_review action=reply，齐备即闭环）。`
       default:
