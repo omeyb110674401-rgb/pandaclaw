@@ -132,6 +132,9 @@ export const WORD_LIMITS = {
 /** 同一议题（同会议同回路阶段）的总轮次上限（三审制，协议 §4）. */
 export const MAX_ROUNDS_PER_STAGE = 3
 
+/** 单条文本的硬上限（入库截断防线；各文书的行为限值另见 WORD_LIMITS）. */
+export const MAX_TEXT_CHARS = 4000
+
 /** 表决立场全集：选票三态（多数决类）∪ 确证书两态（MIN 核验类）. */
 export type Stance = '赞成' | '反对' | '弃权' | '确认' | '更正'
 

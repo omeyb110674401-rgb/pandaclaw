@@ -103,14 +103,17 @@ dsh --profile web                                      # 新会话视图环出�
         监督窗口四态(开放/即将关闭/二阶段替身/已关窗) · 复审面板(六阶段状态行) · 计票历史(全轮次·征询标注)
         记录流(种类筛选/退回理由) · 复审意见/回告标签 · 空态快速开始卡
           ▲ faceOf('pandaclaw') 快照推送（客户端零折叠）
-主机    PandaClawService ──自有记录域 pandaclaw(meetings/records/tallies)
+主机    PandaClawService（会议核心）── PandaClawStore（领域仓库）──自有记录域 pandaclaw(meetings/records/tallies)
+        ├ ReviewService（复审领域类：ReviewSpawner→AgentHost 派发替身）
+        ├ AgentHost（底座装配抽象：工具装备策略 · 替身创建/清理 · 5B 兜底 · 启动恢复）
         ├ 主席台 8 工具(普通会话) ├ 成员 2 工具(子代理作用域) ├ 异议方陈述 1 工具(成员面)
         ├ 监督替身 1 工具(专用 preset) └ 审查替身 1 工具(专用 preset, 服务层 spawn)
-底座    dsh-team 等 agent-team 插件：成员创建 · 消息投递 · managed 纪律
+底座    dsh-team 等 agent-team 插件：成员创建 · 消息投递 · managed 纪律（经 AgentHost 契约可替换）
 ```
 
-- **记录域自有**：成员产物经工具直落库，零转录造假空间；换任何 agent-team 底座，协议层不受影响。
+- **记录域自有**：成员产物经工具直落库，零转录造假空间；换任何 agent-team 底座，协议层不受影响（底座依赖收敛在 `AgentHost` 契约内，ADR-0012）。
 - **投影驱动 UI**：工具结果携带实体快照入日志，fold 重建看板，框架推送到浏览器。
+- **模块化结构（1.8.0）**：`src/store.ts` 领域仓库（纯数据访问）＋`src/review.ts` 复审领域类（状态机/泵/恢复/出口）＋`src/host.ts` 底座装配抽象（`makeAgentHost`）＋`src/service.ts` 会议核心与壳转发＋`src/review-tools.ts`/`src/client/review-panel.tsx` 工具面与面板归位（ADR-0012）。
 
 ## 制度依据
 
@@ -137,7 +140,7 @@ M1-M17 逐条裁定见 [docs/协议校准底稿.md](docs/协议校准底稿.md)�
 
 ```sh
 pnpm install       # 第三方依赖走 .npmrc 配置的镜像源
-pnpm run check     # typecheck + build + smoke（57 项端到端断言）+ 客户端渲染冒烟
+pnpm run check     # typecheck + build + smoke（57 项端到端断言）+ 客户端渲染冒烟 + review.unit（9 组单测）
 ```
 
 首次开发需把本机部署的 harness 包挂进依赖树（`@deepseek-ai/*` 未全量公开发布）：
@@ -166,6 +169,7 @@ prototype-v1/                         # v1.0 TypeScript 代码原型（历史版
 
 ## 版本
 
+- **1.8.0** — 复审领域模块化与可替换装配（ADR-0012，协议 v2.13 不动）：复审 18 方法全量抽离为 `ReviewService` 领域类（`src/review.ts`）＋`PandaClawStore` 领域仓库（`src/store.ts`，纯数据访问）＋`AgentHost` 底座装配抽象（`src/host.ts`，`makeAgentHost` 收编替身派发/工具装备/5B 兜底/启动恢复/统一清理；`standinSpawnerHost` 兼容旧钩子）；`service.ts` 瘦身为会议核心＋12 壳转发（`get review` 属性直连）；复审工具面（`review-tools.ts`）与客户端复审面板（`review-panel.tsx`）归位；工具工厂四组导出（B′ 预设拼装锚点）；smoke 57 组零改动全绿（签名不变证明）＋新增 `review.unit` 单测（9 组 11 断言：CAS 并发/spawn 回滚/restart/dispose 兜底/恢复重建/谱系对称/解释再开轮/三分类批量/交卷销毁）。
 - **1.7.0** — 复审执行模型韧性（ADR-0011，协议 v2.13）：启动扫描恢复（重建滞留 reviewing/accepted 档案→泵 filed）、spawn 失败回滚留池＋真串行、CAS 条件推进防并发重复出审、替身死亡 dispose 事件自动重泵、（`pc_review` 新增 `restart`）用户逃生门、恢复动作 `review-event` 系统事件落板、替身生命周期显式化（交卷/废弃即 dispose）＋启动清理死会话、监督替身纳入同一韧性框架；效力语义修正（ADR-0010 追加）：修订新卷正常入池＋谱系双向入档（originDocId＋上轮审查结论注入审查包）、解释性决议同效力同义务（同卷复审再开一轮）、归档门禁补表决合法性检查（决定必经表决）、审查意见三分类收敛（维持/建议修订/建议解释——「建议驳回」不再产出，撤销=修订子形态，batch-dismiss 仅「维持」可批量）。
 - **1.6.0** — 复审回告闭环（ADR-0010，协议 v2.12）：已归档案卷六阶段复审（登记→受理→审查→沟通→出口→回告）；**复审模式分层**——主力档（RES/LEG）归档位点批量泵自动出审（按优先级，征询采信优先）、次级/弱档（PLA/STR/CON）用户在场专项开启、MIN 不复审；降级标记唯一=征询采信（验收 skip 非降级）；出口**分级批量驳回**（建议维持/驳回可 batch-dismiss，建议修订/解释逐件三选）；**去 AI 中介**——审查替身/监督替身均由服务层 spawn（`ctx.agents.create`，seed 空、setup 硬编码），审查替身只见结构化审查包（含降级标记）；异议方（反对票成员）原会话被动陈述；逐条回告闭环（立法法 §113 同构）；新增 `pc_review`/`pc_review_verdict`/`pc_review_statement`；监督替身派发从主持人迁至 tally 门二受阻服务层自动。
 - **1.5.0** — 监督窗口两阶段（ADR-0008/0009，协议 v2.11）：`warning` 关窗预告＋`supervision` 监督记录做成 `pc_tally` 前置门（LLM 本地时钟）；用户缺席由监督替身（`pc_supervise`，专用 preset）代提、不算票可撤回；UI 监督窗口四态＋复审子通道入口。

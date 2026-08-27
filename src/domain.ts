@@ -84,6 +84,15 @@ export const tallySchema = z.object({
   at: z.number(),
 })
 
+/** 会议存储行（store/service/review 三面共用的行类型，schema 邻位）. */
+export type MeetingRow = z.infer<typeof meetingSchema>
+
+/** 文书存储行. */
+export type RecordRow = z.infer<typeof recordSchema>
+
+/** 计票存储行. */
+export type TallyRow = z.infer<typeof tallySchema>
+
 /** PandaClaw 拥有的域：三张表，主键分别为文号、记录 id、计票复合键. */
 export const PANDACLAW_DOMAIN = defineDomain({
   name: 'pandaclaw',

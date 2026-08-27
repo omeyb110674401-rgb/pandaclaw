@@ -2,13 +2,14 @@
  * dsh-pandaclaw：民主协商多智能体会议系统（dsh-team 之上的伴生插件）.
  *
  * 一行装配四件事：会议服务（自有记录域）、`pandaclaw` 会话投影、主持人
- * 工具面（pc_convene/stage/record/tally/adjourn/inspect/rebind）、成员工具面（pc_submit/
- * pc_vote，装进每个子代理作用域，按建会名单放行）。成员创建与消息投递
- * 不归本插件——那底座的事；程序与裁决归本插件——谁也绕不过.
+ * 工具面（pc_convene/stage/record/tally/adjourn/inspect/rebind 与复审
+ * 工具面）、成员工具面（pc_submit/pc_vote/pc_review_statement，装进每个
+ * 子代理作用域，按建会名单放行）。成员创建与消息投递不归本插件——那底座
+ * 的事；程序与裁决归本插件——谁也绕不过.
  *
- * 替身派发（ADR-0010 策略一）：审查替身与监督替身均由服务层 spawn——插件装配
- * 时把 `ctx.agents.create` 以硬编码参数（seed 空 + setup 代码注入）桥接给服务层
- * 的 spawn 钩子；任何 AI（主持人/用户会话）都不生成替身的提示词或参数。
+ * 底座装配抽象（模块化 A 阶段）：工具装备策略与替身派发全部收编进
+ * AgentHost（makeAgentHost）——本文件只注册四组装备策略（策略留，
+ * 机制进 host；Q22-A）与启动恢复桥接.
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -18,14 +19,13 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-tools'
 import { PandaClawService } from './service.ts'
 import { pcProjection } from './projection.ts'
-import { adjournTool, conveneTool, inspectTool, recordTool, rebindTool, reviewStatementTool, reviewTool, stageTool, submitTool, superviseTool, tallyTool, verdictTool, voteTool } from './tools.ts'
+import { reviewStatementTool, reviewTool, verdictTool } from './review-tools.ts'
+import { adjournTool, conveneTool, inspectTool, recordTool, rebindTool, stageTool, submitTool, superviseTool, tallyTool, voteTool } from './tools.ts'
+import {
+  REVIEWER_PRESET, SUPERVISOR_STANDIN_PRESET, makeAgentHost, type ToolFactory,
+} from './host.ts'
 
 export const name = 'pandaclaw'
-
-/** 无 node 依赖的会话 id 后缀（第三方插件不引 @types/node）. */
-function shortId(): string {
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-}
 
 /**
  * `storageDomain` 是硬依赖（无记录域的会议系统没有约束力）；
@@ -33,88 +33,38 @@ function shortId(): string {
  */
 export const inject = ['agents', 'sessionProjections', 'storageDomain', 'tools', 'systemPrompt', 'session']
 
-export { PandaClawService }
+export { PandaClawService } from './service.ts'
+export { ReviewService } from './review.ts'
+export {
+  REVIEWER_PRESET, SUPERVISOR_STANDIN_PRESET, makeAgentHost, standinSpawnerHost,
+  type AgentHost, type ToolFactory, type ReviewSpawner, type SupervisorSpawner,
+} from './host.ts'
+
+/**
+ * 工具工厂面（B′ 预设目录拼装复用；机制归宿主插件，策略随本导出供 preset 引用）.
+ */
+export function leaderFactories(): readonly ToolFactory[] {
+  return [conveneTool, stageTool, recordTool, tallyTool, adjournTool, inspectTool, rebindTool, reviewTool]
+}
 
 /** A team chair is any ordinary session; teammates submit and vote only. */
 function leads(agent: Agent): boolean {
   return agent.session.header.origin !== 'subagent'
 }
 
-/**
- * 工具定义的桥接：宿主 ToolDefinition 的字面量联合约束对第三方工厂过窄，
- * 这里做显式桥接并守住「必备回调齐全」这条底线；深度形状由注册器自身的
- * schema 校验负责.
- */
-function asTool(def: Record<string, unknown>): Parameters<Context['tools']['register']>[0] {
-  const name = String(def.name ?? '<unnamed>')
-  const output = def.output as { readonly schema?: unknown; readonly render?: unknown } | undefined
-  if (typeof def.execute !== 'function' || output === undefined || output.schema === undefined || typeof output.render !== 'function') {
-    throw new Error(`PandaClaw 工具定义不完整（缺 execute/output.schema/output.render）：${name}`)
-  }
-  return def as unknown as Parameters<Context['tools']['register']>[0]
-}
-
-type ToolFactory = (svc: PandaClawService) => Record<string, unknown>
-
-/**
- * 把一组工具装进一个代理自己的作用域.
- * @param agent - 目标会话代理.
- * @param factories - 工具工厂（闭包持有服务句柄）.
- * @returns 卸载 disposer.
- */
-function installTools(agent: Agent, factories: readonly ToolFactory[]): () => void {
-  const svc = agent.ctx.pandaclaw
-  const disposers = factories.map(factory => agent.ctx.tools.register(asTool(factory(svc))))
-  return () => {
-    for (const dispose of disposers.reverse()) dispose()
-  }
-}
-
-/** 主持人工具面（普通会话专属；子代理永远不是主席台）. */
-function leaderFactories(): readonly ToolFactory[] {
-  return [conveneTool, stageTool, recordTool, tallyTool, adjournTool, inspectTool, rebindTool, reviewTool]
-}
-
 /** 成员工具面（子代理作用域；名单外调用在服务层被拒）. */
-function memberFactories(): readonly ToolFactory[] {
+export function memberFactories(): readonly ToolFactory[] {
   return [submitTool, voteTool, reviewStatementTool]
 }
 
-/** 用户监督替身工具面（ADR-0009）：以 `pc-supervisor-standin` preset 创建的替身专用，只装监督工具，不碰投票/成员产物. */
-const SUPERVISOR_STANDIN_PRESET = 'pc-supervisor-standin'
-
-function supervisorFactories(): readonly ToolFactory[] {
+/** 用户监督替身工具面（ADR-0009）：`pc-supervisor-standin` preset 专用，只装监督工具. */
+export function supervisorFactories(): readonly ToolFactory[] {
   return [superviseTool]
 }
 
-/** 审查替身专用 preset（ADR-0010）：服务层 spawn、seed 空、setup 代码注入结构化审查包. */
-const REVIEWER_PRESET = 'pc-reviewer'
-
 /** 审查替身工具面：只装审查意见直写工具，不碰成员/监督面. */
-function reviewerFactories(): readonly ToolFactory[] {
+export function reviewerFactories(): readonly ToolFactory[] {
   return [verdictTool]
-}
-
-/**
- * 为现有与后续的匹配会话装备工具，直到本注册被卸载.
- * @param ctx - 行上下文.
- * @param match - 会话准入判定.
- * @param factories - 工具工厂集.
- * @returns disposer：撤下所有存活会话上的工具.
- */
-function equipSessions(ctx: Context, match: (agent: Agent) => boolean, factories: readonly ToolFactory[]): () => void {
-  const equipped = new Map<string, () => void>()
-  const equip = (agent: Agent): void => {
-    if (!match(agent) || equipped.has(agent.id)) return
-    equipped.set(agent.id, installTools(agent, factories))
-  }
-  ctx.on('agent/created', (payload: { readonly agent: Agent }) => { equip(payload.agent) })
-  ctx.on('agent/disposed', (payload: { readonly agent: Agent }) => { equipped.delete(payload.agent.id) })
-  for (const agent of ctx.agents.list()) equip(agent)
-  return () => {
-    for (const dispose of equipped.values()) dispose()
-    equipped.clear()
-  }
 }
 
 /**
@@ -122,81 +72,15 @@ function equipSessions(ctx: Context, match: (agent: Agent) => boolean, factories
  * @param ctx - 行上下文（inject 列出的服务均已就绪）.
  */
 export function apply(ctx: Context): void {
-  // 服务层 spawn 钩子（ADR-0010 策略一 + ADR-0011 韧性）：审查替身/监督替身一律由
-  // 宿主机械创建——seed 空、setup 代码注入，任何 AI 都不生成替身参数。
-  // 替身 handle 注册表（sessionId→dispose）：Q10-A 交卷/回滚/废弃主动销毁，
-  // Q10-C 启动清理死会话，5B dispose 监听反查案卷号.
-  const reviewerHandles = new Map<string, { readonly docId: string; dispose(): Promise<void> }>()
-  const supervisorHandles = new Map<string, { readonly docId: string; dispose(): Promise<void> }>()
-  ctx.plugin(PandaClawService, {
-    spawner: {
-      async spawnReviewer(docId, review) {
-        const sessionId = `subagent-review-${docId}-${shortId()}` as never
-        const handle = await ctx.agents.create({
-          sessionId,
-          meta: { origin: 'subagent', agentPreset: REVIEWER_PRESET },
-          setup: agentCtx => {
-            const payload = JSON.stringify(review)
-            agentCtx.systemPrompt.section({
-              name: 'pandaclaw-reviewer-brief',
-              order: 10,
-              text: '你是 PandaClaw 备案审查复审判卷的审查替身（`pc-reviewer`）。'
-                + '职责：依据下发的结构化审查包，对已归档案卷的决议作出审查判断——'
-                + '维持／建议修订／建议解释（三分类；认为应撤销的决议并入「建议修订重议」并在处置清单注明），'
-                + '并给出逐条处置清单。只审查下发数据，绝不猜测案卷记录流里的其他内容；'
-                + '审查结论是建议性意见，最终由用户三选裁量。完成后调用 pc_review_verdict 直写审查意见（≤600 字）。\n\n'
-                + `【结构化审查包】\n${payload}`,
-            })
-          },
-        })
-        reviewerHandles.set(String(sessionId), { docId, dispose: () => handle.dispose() })
-      },
-      async disposeReviewer(docId) {
-        for (const [sessionId, entry] of reviewerHandles) {
-          if (entry.docId === docId) {
-            reviewerHandles.delete(sessionId)
-            await entry.dispose()
-          }
-        }
-      },
-      async disposeAllStandins() {
-        for (const [, entry] of reviewerHandles) await entry.dispose()
-        reviewerHandles.clear()
-      },
-    },
-    supervisorSpawner: {
-      async spawnSupervisor(docId, _stage, _round) {
-        const sessionId = `subagent-supervisor-${docId}-${shortId()}` as never
-        const handle = await ctx.agents.create({
-          sessionId,
-          meta: { origin: 'subagent', agentPreset: SUPERVISOR_STANDIN_PRESET },
-          setup: agentCtx => {
-            agentCtx.systemPrompt.section({
-              name: 'pandaclaw-supervisor-brief',
-              order: 10,
-              text: '你是 PandaClaw 用户监督替身（`pc-supervisor-standin`）：用户缺席该轮 ⭐ 阶段的监督窗口（无本人回应），'
-                + '你以其民众监督者立场对当前阶段议题提一条监督质疑。只提监督质疑（风险/遗漏/程序关切），'
-                + '禁止代替用户表达赞成或反对立场；意见不算票、可被用户追认或撤回。'
-                + `当前案卷：${docId}。完成后调用 pc_supervise 直写（≤300 字）。`,
-            })
-          },
-        })
-        supervisorHandles.set(String(sessionId), { docId, dispose: () => handle.dispose() })
-      },
-      async disposeSupervisor(docId) {
-        for (const [sessionId, entry] of supervisorHandles) {
-          if (entry.docId === docId) {
-            supervisorHandles.delete(sessionId)
-            await entry.dispose()
-          }
-        }
-      },
-      async disposeAllStandins() {
-        for (const [, entry] of supervisorHandles) await entry.dispose()
-        supervisorHandles.clear()
-      },
-    },
+  // 底座装配面（模块化 A 阶段 Q21-Q23）：替身派发/工具装备/5B 监听/启动恢复
+  // 全在 AgentHost；本行只注册装备策略与桥接回调.
+  const host = makeAgentHost(ctx, {
+    // 启动恢复（ADR-0011 Q1/Q11）：装配完成后延迟一拍执行（agents/preset 就绪）；
+    // 全员失败 loud 由 ReviewService 负责（此处惰性访问已挂载的服务）.
+    onStartup: () => void ctx.pandaclaw.recoverReviews().catch(() => undefined),
   })
+  ctx.plugin(PandaClawService, { host })
+  ctx.effect(() => () => void host.dispose(), 'pandaclaw: agent host cleanup')
   ctx.inject(['pandaclaw'], (pc: Context) => {
     pc.effect(
       // 'pandaclaw' 是第三方自定义键，不在宿主封闭键映射内；运行时注册器
@@ -205,31 +89,24 @@ export function apply(ctx: Context): void {
       'pandaclaw: durable projection unit',
     )
     pc.effect(() => () => { void pc.pandaclaw.dispose() }, 'pandaclaw: domain release')
-    // 5B dispose 兜底（ADR-0011）：监听 agent/disposed——审查替身会话被意外销毁
-    // （非主动 dispose）时反查案卷号并触发服务层回滚重泵；主动 dispose（交卷/restart）
-    // 时档案状态已离开 reviewing/accepted，服务层条件天然不触发.
+    // 5B dispose 兜底（ADR-0011 Q5-B）：宿主 agent/disposed 监听仅审查替身触发
+    // 回调，桥接到服务层（服务层条件不满足时静默）.
     pc.effect(
-      () => {
-        const disposeListener = (payload: { readonly agent: Agent }): void => {
-          const sessionId = String(payload.agent.id)
-          const entry = reviewerHandles.get(sessionId)
-          if (entry === undefined) return
-          reviewerHandles.delete(sessionId)
-          void pc.pandaclaw.handleStandinDisposed(entry.docId).catch(() => undefined)
-        }
-        // ctx.on 返回 disposer（Cordis 惯例：注册是 effect，随作用域释放自动移除）.
-        return ctx.on('agent/disposed', disposeListener as never)
-      },
+      () => host.onStandinDisposed(info => {
+        void pc.pandaclaw.handleStandinDisposed(info.docId).catch(() => undefined)
+      }),
       'pandaclaw: reviewer dispose fallback',
     )
+    // 装备策略（Q22-A：机制进 host，策略留本层）——四组：主持人/监督替身/
+    // 审查替身/成员面；registerEquip 自带现存会话补装与 agent/created 分发.
     pc.effect(
-      () => equipSessions(pc, leads, leaderFactories()),
+      () => host.registerEquip(leads, leaderFactories()),
       'pandaclaw: leader tools',
     )
     // 用户监督替身（ADR-0009/0010）：专用 preset 的子代理只装监督面，不进入成员面
     // （成员面会装 vote/submit，替身不是投票成员）；spawn 由服务层在 tally 门二受阻时自动完成.
     pc.effect(
-      () => equipSessions(pc, agent => {
+      () => host.registerEquip(agent => {
         if (leads(agent)) return false
         return agent.session.header.agentPreset === SUPERVISOR_STANDIN_PRESET
       }, supervisorFactories()),
@@ -237,30 +114,19 @@ export function apply(ctx: Context): void {
     )
     // 审查替身（ADR-0010）：`pc-reviewer` preset 只装审查意见直写工具，进不了成员面/监督面.
     pc.effect(
-      () => equipSessions(pc, agent => {
+      () => host.registerEquip(agent => {
         if (leads(agent)) return false
         return agent.session.header.agentPreset === REVIEWER_PRESET
       }, reviewerFactories()),
       'pandaclaw: reviewer tools',
     )
     pc.effect(
-      () => equipSessions(pc, agent => {
+      () => host.registerEquip(agent => {
         if (leads(agent)) return false
         const preset = agent.session.header.agentPreset
         return preset !== SUPERVISOR_STANDIN_PRESET && preset !== REVIEWER_PRESET
       }, memberFactories()),
       'pandaclaw: member tools',
-    )
-    // 启动恢复（ADR-0011 Q1/Q11）：装配完成后延迟一拍执行（agents/preset 就绪）；
-    // 重建全档位 reviewing/accepted → 泵主力档 filed；全员失败 loud 由服务层负责.
-    pc.effect(
-      () => {
-        const timer = setTimeout(() => {
-          void pc.pandaclaw.recoverReviews().catch(() => undefined)
-        }, 0)
-        return () => { clearTimeout(timer) }
-      },
-      'pandaclaw: startup review recovery',
     )
   })
 }

@@ -12,24 +12,24 @@
 
 import { Service, type Context } from '@deepseek-ai/cordis'
 import type { Domain } from '@deepseek-ai/dsh-storage-domain'
-import type { z } from 'zod'
 import {
-  type PcFact, type PcMeetingView, type PcMemberView,
-  type PcRecordView, type PcReviewView, type PcTallyView,
+  type PcFact, type PcMeetingView, type PcRecordView, type PcTallyView,
 } from './contract.ts'
-import { PANDACLAW_DOMAIN, buildRecordId, tallyKey,
-  type meetingSchema, type recordSchema, type tallySchema } from './domain.ts'
+import { PANDACLAW_DOMAIN, buildRecordId,
+  type MeetingRow, type RecordRow, type TallyRow } from './domain.ts'
 import { PcError } from './errors.ts'
 import {
-  MAX_ROUNDS_PER_STAGE, MAX_REVIEW_PER_DOC, REVIEW_FLOW, REVIEW_TIERS, REVIEW_OPINION_LIMIT,
+  SUPERVISOR_STANDIN_PRESET, standinSpawnerHost, type AgentHost,
+  type ReviewSpawner, type SupervisorSpawner,
+} from './host.ts'
+import {
+  MAX_ROUNDS_PER_STAGE, MAX_TEXT_CHARS, REVIEW_TIERS,
   RULING_GATED_STAGES, STAGE_FLOWS, TIER_ROSTER, VOTE_STAGES, WORD_LIMITS,
   defaultValidation, hasOpinionStructure, passRuleFor, parseDocumentId, reviewPriority, stancesFor, tally as mechanicalTally,
   type MeetingType, type RecordKind, type ReviewFlag, type ReviewState, type Seat, type Tier, type Validation,
 } from './protocol.ts'
-
-type MeetingRow = z.infer<typeof meetingSchema>
-type RecordRow = z.infer<typeof recordSchema>
-type TallyRow = z.infer<typeof tallySchema>
+import { ReviewService } from './review.ts'
+import { makeStore, toMeetingView, toRecordView, toTallyView, type PandaClawStore } from './store.ts'
 
 /**
  * 主持人登记的锚点种类.
@@ -45,9 +45,6 @@ const MEMBER_KIND_SEATS: Readonly<Partial<Record<RecordKind, Exclude<Seat, 'chai
   inquiry: 'npc',
   reply: 'cppcc',
 }
-
-/** 单条文本的硬上限（入库截断防线；各文书的行为限值另见 WORD_LIMITS）. */
-const MAX_TEXT_CHARS = 4000
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -66,104 +63,56 @@ export interface ConveneRequest {
   readonly npcNames: readonly string[]
 }
 
-/**
- * 审查替身 spawn 钩子（ADR-0010 策略一：服务层全自动，不经任何 AI）。
- * 由宿主装配（index.ts）注入 `ctx.agents.create` 的真实实现；测试可注入桩。
- * 钩子只负责「派发」，不等待替身产出（替身异步直写服务层完成闭环）。
- */
-export interface ReviewSpawner {
-  /**
-   * 派发一个审查替身（preset `pc-reviewer`，seed 空、setup 代码硬编码——只接收
-   * 服务层构造的结构化审查包，不见任何原始自由文本）.
-   * @param docId - 被审查案卷号（审查包内唯一自由化输入，由服务层校验格式）.
-   * @param review - 结构化审查包（决议原文/票况/规约核对结果等代码选取字段）.
-   */
-  spawnReviewer(docId: string, review: Readonly<Record<string, unknown>>): Promise<void>
-  /**
-   * 销毁某案卷的审查替身会话（ADR-0011 Q10-A：交卷/回滚/废弃时服务层调用；
-   * 底座 handle.dispose 幂等，并触发 `agent/disposed`——主动销毁时档案状态
-   * 已离开 reviewing/accepted，5B 兜底条件天然不触发）.
-   * @param docId - 案卷号（spawn 登记表的键）.
-   */
-  disposeReviewer(docId: string): Promise<void>
-  /**
-   * 清理全部替身死会话（ADR-0011 Q10-C：启动扫描调用；进程重启后必然无驱动者）.
-   */
-  disposeAllStandins?(): Promise<void>
-}
-
-/**
- * 用户监督替身 spawn 钩子（ADR-0010 第 9 节，Q8-B：tally 门二受阻时服务层自动 spawn）.
- * 取代 ADR-0009「主持人经底座 spawn」的旧链路——派发完全脱离 AI 之手.
- */
-export interface SupervisorSpawner {
-  /**
-   * 派发一个用户监督替身（preset `pc-supervisor-standin`，seed 空、setup 代码硬编码）.
-   * @param docId - 当前 ⭐ 阶段所在案卷号.
-   * @param stage - 拟计票阶段标识.
-   * @param round - 拟计票轮次.
-   */
-  spawnSupervisor(docId: string, stage: string, round: number): Promise<void>
-  /**
-   * 销毁某案卷的监督替身会话（ADR-0011 Q12：门二窗口关闭/交卷后清理）.
-   * @param docId - 案卷号.
-   */
-  disposeSupervisor?(docId: string): Promise<void>
-  /**
-   * 清理全部监督替身死会话（ADR-0011 Q10-C/Q12）.
-   */
-  disposeAllStandins?(): Promise<void>
-}
-
 /** PandaClaw 服务（插件行 `pandaclaw`）. */
 export class PandaClawService extends Service {
-  private readonly opening: Promise<Domain<typeof PANDACLAW_DOMAIN>>
+  private readonly opening?: Promise<Domain<typeof PANDACLAW_DOMAIN>>
+  private readonly store: PandaClawStore
+  /** 底座装配面（替身派发/清理）；缺省＝不派发（测试/纯逻辑环境）.*/
+  private readonly host?: AgentHost
+  private readonly reviewService: ReviewService
   private disposed = false
-  /** 审查替身 spawn 钩子（ADR-0010 策略一）；缺省 no-op（测试/纯逻辑环境不派发）.*/
-  private readonly spawner?: ReviewSpawner
-  /** 监督替身 spawn 钩子（ADR-0010 第 9 节）；缺省 no-op. */
-  private readonly supervisorSpawner?: SupervisorSpawner
 
   /**
    * @param ctx - 行上下文；`ctx.storageDomain` 已由 inject 保证在场.
-   * @param options - 可选注入：审查替身/监督替身 spawn 钩子.
+   * @param options - 可选注入：领域仓库（缺省自建）与底座装配面；
+   * 旧 spawn 钩子（spawner/supervisorSpawner）保留为兼容入口，内部经
+   * `standinSpawnerHost` 适配为 {@link AgentHost}（Q11-A：测试零改动护栏）.
    */
-  constructor(ctx: Context, options: { readonly spawner?: ReviewSpawner; readonly supervisorSpawner?: SupervisorSpawner } = {}) {
+  constructor(ctx: Context, options: {
+    readonly store?: PandaClawStore
+    readonly host?: AgentHost
+    readonly spawner?: ReviewSpawner
+    readonly supervisorSpawner?: SupervisorSpawner
+  } = {}) {
     super(ctx, 'pandaclaw')
-    this.spawner = options.spawner
-    this.supervisorSpawner = options.supervisorSpawner
-    this.opening = ctx.storageDomain.open(PANDACLAW_DOMAIN)
-    void this.opening.then(domain => {
+    // store 缺省时由服务自建域句柄并持有释放权；注入时释放权归调用方.
+    const opening = options.store === undefined ? ctx.storageDomain.open(PANDACLAW_DOMAIN) : undefined
+    this.opening = opening
+    this.store = options.store ?? makeStore(opening!)
+    this.host = options.host
+      ?? (options.spawner !== undefined || options.supervisorSpawner !== undefined
+        ? standinSpawnerHost(options.spawner, options.supervisorSpawner)
+        : undefined)
+    this.reviewService = new ReviewService(this.store, this.host, { logger: ctx.logger })
+    void this.opening?.then(domain => {
       if (this.disposed) void domain.close()
     }, () => {
       // 打开失败在首个使用点暴露；这里无处可报，保持进程存活.
     })
   }
 
-  /** @returns 释放记录域句柄（apply 经 effect 挂接）. */
+  /** @returns 释放记录域句柄（apply 经 effect 挂接）；注入 store 时无自有句柄可释放. */
   dispose(): void | Promise<void> {
     this.disposed = true
-    return this.opening.then(domain => domain.close(), () => undefined)
+    return this.opening?.then(domain => domain.close(), () => undefined)
+  }
+
+  /** 复审领域面（Q7-A `get review` 属性直连：外部与工具层经此访问复审方法）. */
+  get review(): ReviewService {
+    return this.reviewService
   }
 
   // —— 内部读取 ——
-
-  private async domain(): Promise<Domain<typeof PANDACLAW_DOMAIN>> {
-    return this.opening
-  }
-
-  private async meetingOrThrow(docId: string): Promise<MeetingRow> {
-    const meetings = (await this.domain()).table('meetings')
-    const row = meetings.get(docId)
-    if (row === undefined) throw new PcError('MEETING_NOT_FOUND', `文号 ${docId} 不存在：先用 pc_convene 建会，或核对文号拼写`)
-    return row
-  }
-
-  private async recordsOf(docId: string): Promise<RecordRow[]> {
-    const records = (await this.domain()).table('records')
-    return [...records.entries()].map(([, value]) => value)
-      .filter(record => record.docId === docId)
-  }
 
   private stageIndex(row: MeetingRow, stageId: string): number {
     const index = row.stages.findIndex(stage => stage.id === stageId)
@@ -211,518 +160,45 @@ export class PandaClawService extends Service {
     }
   }
 
-  private nextSeq(priorRecords: readonly RecordRow[], prefixMatch: (record: RecordRow) => boolean): number {
-    let seq = 0
-    for (const record of priorRecords) if (prefixMatch(record)) seq += 1
-    return seq + 1
-  }
-
-  private async putRecord(row: RecordRow): Promise<PcRecordView> {
-    const records = (await this.domain()).table('records')
-    await records.put(row.id, row)
-    return toRecordView(row)
-  }
-
-  // —— 复审回告闭环（ADR-0010）：私有辅助 ——
-
-  /** 读取会议行的复审视图；无 review 字段时返回全缺省（idle/无标记/0 条）. */
-  private reviewOf(row: MeetingRow): PcReviewView {
-    const review = row.review
-    return {
-      state: review?.state ?? 'idle',
-      flag: review?.flag ?? 'none',
-      count: review?.count ?? 0,
-      ...(review?.choice !== undefined ? { choice: review.choice as PcReviewView['choice'] } : {}),
-      ...(review?.revisedDocId !== undefined ? { revisedDocId: review.revisedDocId } : {}),
-      ...(review?.interpretRecordId !== undefined ? { interpretRecordId: review.interpretRecordId } : {}),
-      ...(review?.originDocId !== undefined ? { originDocId: review.originDocId } : {}),
-      ...(review?.sourceReviewNote !== undefined ? { sourceReviewNote: review.sourceReviewNote } : {}),
-      ...(review?.priority !== undefined ? { priority: review.priority } : {}),
-    }
-  }
-
-  /** 原子推进复审状态（读改写：并发复审动作不丢状态）. */
-  private async advanceReview(docId: string, mutate: (review: NonNullable<MeetingRow['review']>) => void): Promise<PcMeetingView> {
-    const meetings = (await this.domain()).table('meetings')
-    let view!: PcMeetingView
-    await meetings.update(docId, row => {
-      const current: NonNullable<MeetingRow['review']> = row.review ?? { state: 'idle', flag: 'none', count: 0 }
-      mutate(current)
-      row.review = current
-      view = toMeetingView(row)
-      return row
-    })
-    return view
-  }
+// —— 复审回告闭环（壳转发，Q7-A：同名签名一行转发，实现归 ReviewService）——
 
   /**
-   * 条件推进复审状态（ADR-0011 Q4-B：CAS）。
-   * predicate 在域存储的原子读改写回调内检查当前状态——谓词不满足则不推进、
-   * 返回 applied=false；并发调用同一档案时只有一个胜出（「只有确实是 filed 才出审」
-   * 成为状态机自带的原子语义）.
-   * @param docId - 文号.
-   * @param predicate - 当前状态谓词（在 update 回调内求值）.
-   * @param mutate - 推进变更（谓词为真时执行）.
-   * @returns 是否实际推进（谓词为假返回 false）.
-   */
-  private async advanceReviewIf(docId: string, predicate: (state: ReviewState) => boolean, mutate: (review: NonNullable<MeetingRow['review']>) => void): Promise<boolean> {
-    const meetings = (await this.domain()).table('meetings')
-    let applied = false
-    await meetings.update(docId, row => {
-      const current: NonNullable<MeetingRow['review']> = row.review ?? { state: 'idle', flag: 'none', count: 0 }
-      if (!predicate(current.state)) return row
-      mutate(current)
-      row.review = current
-      applied = true
-      return row
-    })
-    return applied
-  }
-
-  /** 恢复/失败动作落板为系统事件（ADR-0011 Q7-A：kind='review-event'，authorName='系统'）. */
-  private async recordReviewEvent(docId: string, text: string): Promise<void> {
-    const records = await this.recordsOf(docId)
-    const seq = this.nextSeq(records, record => record.kind === 'review-event')
-    await this.putRecord({
-      id: buildRecordId({ docId, kind: 'review-event', stage: 'review', authorName: '系统', seq }),
-      docId,
-      kind: 'review-event',
-      stage: 'review',
-      seat: 'chair',
-      authorName: '系统',
-      authorSessionId: 'system',
-      text,
-      at: Date.now(),
-    })
-  }
-
-  /**
-   * 构造结构化审查包（ADR-0010 Q9-B）：替身只收代码选取的结构化数据，
-   * 决议原文/票况/规约核对——用户意见与监督意见的原始全文零进入.
-   * @param row - 被审查会议行.
-   * @returns 审查包（setup 注入替身的全部输入）.
-   */
-  private async buildReviewPackage(row: MeetingRow): Promise<Readonly<Record<string, unknown>>> {
-    const [records, tallies] = await Promise.all([
-      this.recordsOf(row.docId),
-      (async () => [...(await this.domain()).table('tallies').entries()]
-        .map(([, value]) => value).filter(entry => entry.docId === row.docId))(),
-    ])
-    const resolution = records.find(record => record.kind === 'resolution')
-    const flag = this.reviewFlagOf(records)
-    return {
-      docId: row.docId,
-      type: row.type,
-      validation: row.validation,
-      topic: row.topic,
-      status: row.status,
-      // 降级标记（Q4：唯一 consultive=征询采信）：审查替身识别「留了尾巴」的档案，重点核验采信是否合理.
-      reviewFlag: flag,
-      resolutionText: resolution?.text ?? '',
-      // 票况只取结构化字段（不含选票理由原文）.
-      tallies: tallies.map(tally => ({
-        stage: tally.stage, round: tally.round, aye: tally.aye, nay: tally.nay,
-        abstain: tally.abstain, mode: tally.mode, passed: tally.passed, rule: tally.rule,
-      })),
-      // 程序完成度：阶段流完成情况（不含记录全文）.
-      stagesDone: row.stages.filter(stage => stage.state === 'done').length,
-      stagesTotal: row.stages.length,
-      // 规约核对：主线规约是否成立（决议存在/全阶段完成）.
-      hasResolution: resolution !== undefined,
-      allStagesDone: row.stages.every(stage => stage.state === 'done'),
-      // 修订谱系（Q14-A）：本卷系修订自哪个原卷＋上轮审查结论摘要——审查焦点＝修订是否消除原问题.
-      ...(row.review?.originDocId !== undefined ? { originDocId: row.review.originDocId } : {}),
-      ...(row.review?.sourceReviewNote !== undefined ? { sourceReviewNote: row.review.sourceReviewNote } : {}),
-      // 解释核验（Q15-A）：本卷此前已有解释性决议——核验解释是否与原决议冲突/引入新问题.
-      ...(row.review?.interpretRecordId !== undefined ? { hasInterpretiveResolution: true } : {}),
-    }
-  }
-
-  /** 判定会议行是否处于「复审进行中」的某个可写状态（非 idle/closed）. */
-  private reviewing(row: MeetingRow): boolean {
-    const state = row.review?.state ?? 'idle'
-    return state !== 'idle' && state !== 'closed'
-  }
-
-  /** 当前复审阶段索引（无则 -1）. */
-  private reviewStageIndex(state: ReviewState): number {
-    return REVIEW_FLOW.findIndex(def => def.id === state)
-  }
-
-  // —— 复审回告闭环（ADR-0010）：公开方法 ——
-
-  /**
-   * 待审池专项出审（ADR-0010 Q1″/Q2：手动窗口）.
-   * 用户明确指定一批案卷（`docIds`）出审——可含任意档位（次级/弱档因此可由
-   * 用户在场批量开启）；主力档已由归档位点批量泵自动出审，无需也不会被本方法
-   * 重复启动（其状态已非 filed）。
-   * @param docIds - 用户指定的案卷号列表（专项批次的唯一依据，必填非空）.
-   * @returns 实际出审的案卷号列表.
+   * 待审池专项出审（实现见 ReviewService.reviewDispatch）.
    */
   async reviewDispatch(docIds: readonly string[]): Promise<readonly string[]> {
-    if (docIds.length === 0) {
-      throw new PcError('REVIEW_STAGE_BLOCKED', '专项出审必须指定案卷（docIds）：要审哪些档案由用户明确点名')
-    }
-    const dispatched: string[] = []
-    for (const docId of docIds) {
-      const row = await this.meetingOrThrow(docId)
-      if (row.status !== 'adjourned') {
-        throw new PcError('REVIEW_UNAVAILABLE', `案卷 ${docId} 未归档，不可出审`)
-      }
-      if (row.type === 'MIN') continue
-      if (await this.startReview(docId, true)) dispatched.push(docId)
-    }
-    return dispatched
+    return this.reviewService.reviewDispatch(docIds)
   }
 
   /**
-   * 提交复审意见并开启复审流程（ADR-0010）。
-   * 入口两路合一：主持人代录用户意见（actorSessionId=主持人会话，text=原汁原味）
-   * 与「有备必审」自动入池（主力档归档即触发）。主力档（RES/LEG）归档自动进入，
-   * 次级/弱档仅本方法显式触发（用户提意见）。
-   * @param actorSessionId - 提交方会话 id（审计字段）.
-   * @param input - 文号与意见全文.
+   * 提交复审意见并开启复审流程（实现见 ReviewService.reviewRequest）.
    */
   async reviewRequest(actorSessionId: string, input: { readonly docId: string; readonly text: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
-    if (row.status !== 'adjourned') {
-      throw new PcError('REVIEW_UNAVAILABLE', `案卷 ${input.docId} 未归档（当前 ${row.status}）：复审只受理已归档的决议；会中监督意见请走监督窗口（pc_record kind=supervision）`)
-    }
-    if (row.type === 'MIN') {
-      throw new PcError('REVIEW_UNAVAILABLE', '纪要型（MIN）不产生新决定（「记」非「决」），无复审对象；对纪要内容的异议走会内更正循环')
-    }
-    // 弱/次级档（CON/PLA/STR）仅用户显式提意见触发——这里即用户通道，直接放行；
-    // 主力档（RES/LEG）归档即自动入池出审（adjourn 侧执行），本方法亦可再开.
-    const prior = this.reviewOf(row)
-    if (prior.state !== 'idle' && prior.state !== 'closed') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${input.docId} 复审已在进行（${prior.state}）：本轮回合内不可重复开启`)
-    }
-    if (prior.count >= MAX_REVIEW_PER_DOC) {
-      throw new PcError('REVIEW_EXHAUSTED', `案卷 ${input.docId} 复审意见已达上限 ${MAX_REVIEW_PER_DOC} 条：后续意见并入既有复审通道（逐条回告义务按已登记意见计）`)
-    }
-    if (input.text.trim().length === 0) {
-      throw new PcError('STRUCTURE_FAIL', '复审意见为空')
-    }
-    if (input.text.length > MAX_TEXT_CHARS) {
-      throw new PcError('WORD_LIMIT', `复审意见 ${input.text.length} 字超硬上限 ${MAX_TEXT_CHARS}`)
-    }
-    const records = await this.recordsOf(input.docId)
-    // 复审意见落板：kind=review，authorName='用户'，标注代录来源（与监督意见同纪律）.
-    const seq = this.nextSeq(records, record => record.kind === 'review')
-    await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: 'review', stage: 'review', authorName: '用户', seq }),
-      docId: input.docId,
-      kind: 'review',
-      stage: 'review',
-      seat: 'chair',
-      authorName: '用户',
-      authorSessionId: actorSessionId,
-      text: input.text,
-      at: Date.now(),
-    })
-    // 状态机：idle → filed（登记+计数）——受理与派发交给 startReview（CAS/await/回滚统一路径）.
-    const flag: ReviewFlag = this.reviewFlagOf(records)
-    const priority = reviewPriority(REVIEW_TIERS[row.type], flag)
-    await this.advanceReview(input.docId, review => {
-      review.state = 'filed'
-      review.flag = flag
-      review.count = prior.count + 1
-      review.priority = priority
-    })
-    // 受理→派发→审查（用户语境：失败抛错给发起人，ADR-0011 Q8-A；意见已落板，回滚后仍留池待重新出审）.
-    await this.startReview(input.docId, true)
-    const done = await this.meetingOrThrow(input.docId)
-    return { pc: 'meeting', meeting: toMeetingView(done) }
+    return this.reviewService.reviewRequest(actorSessionId, input)
   }
 
   /**
-   * 从记录推导协议降级标记（ADR-0010 Q4 修正）.
-   * 降级态唯一＝征询采信（`consultive`）：应答率不足却由用户三选采信归档，
-   * ADR-0004 明文标注「未达法定状态」——真正「协议盖章放行但留了尾巴」.
-   * 验收 skip 不是降级态（RES 默认档的正常产物，非异常；其检验由自动复审覆盖），
-   * 不再产出 `skip-validation`（旧数据兼容由类型保留）.
-   */
-  private reviewFlagOf(records: readonly RecordRow[]): ReviewFlag {
-    const consultive = records.some(record =>
-      record.kind === 'resolution' && /征询采信|未达法定状态/.test(record.text))
-    return consultive ? 'consultive' : 'none'
-  }
-
-  /**
-   * 单件出审启动（Q3 泵/专项调用，ADR-0011 Q2/Q4）：filed → accepted → reviewing，
-   * 并 await 派发审查替身（真串行：成功才推进 reviewing）.
-   * 对尚未入池的档案（弱/次级档专项开启，review 字段缺省）先初始化入池再启动；
-   * spawn 失败回滚 filed 留池（自动语境静默，用户语境抛错——ADR-0011 Q8-A）.
-   * @param docId - 待出审案卷号.
-   * @param userInitiated - 用户在场语境（dispatch/request/restart）：失败抛错给发起人.
-   * @returns 是否实际出审（非 filed 且推进成功）.
-   */
-  private async startReview(docId: string, userInitiated = false): Promise<boolean> {
-    const row = await this.meetingOrThrow(docId)
-    if (row.review !== undefined && row.review.state !== 'filed') return false
-    if (row.review === undefined) {
-      // 尚未入池（用户在场档专项开启）：CAS 初始化 filed（谓词=当前 idle），flag/priority 按协议计算.
-      const records = await this.recordsOf(docId)
-      const flag = this.reviewFlagOf(records)
-      const initialized = await this.advanceReviewIf(docId, state => state === 'idle', review => {
-        review.state = 'filed'
-        review.flag = flag
-        review.count = 0
-        review.priority = reviewPriority(REVIEW_TIERS[row.type], flag)
-      })
-      if (!initialized) return false
-    }
-    // filed → accepted（CAS：并发时只有一个胜出）.
-    const accepted = await this.advanceReviewIf(docId, state => state === 'filed', review => { review.state = 'accepted' })
-    if (!accepted) return false
-    // await spawn（真串行：前一个创建完成才继续）.
-    if (this.spawner !== undefined) {
-      try {
-        const fresh = await this.meetingOrThrow(docId)
-        await this.spawner.spawnReviewer(docId, await this.buildReviewPackage(fresh))
-      } catch (error) {
-        // 失败回滚 filed 留池 + 系统事件留痕（Q7）；自动语境静默、用户语境抛错（Q8）.
-        await this.advanceReview(docId, review => { review.state = 'filed' })
-        await this.recordReviewEvent(docId, `审查替身派发失败，已回滚待审池：${String(error instanceof Error ? error.message : error)}`)
-        if (userInitiated) {
-          throw new PcError('REVIEW_SPAWN_FAILED', `案卷 ${docId} 出审失败：审查替身未能创建，已回滚待审池，请检查底座装配（pc-reviewer preset）后重试`)
-        }
-        return false
-      }
-    }
-    // accepted → reviewing（CAS 兜底竞态：理论不可达，静默返回 false）.
-    const reviewing = await this.advanceReviewIf(docId, state => state === 'accepted', review => { review.state = 'reviewing' })
-    return reviewing
-  }
-
-  /**
-   * 归档位点批量泵（Q3-B）：扫描待审池中全部**主力档**（RES/LEG）filed 案卷，
-   * 按 priority 排序（征询采信优先）逐个 spawn 审查替身（串行：前一个创建完成
-   * 才创建下一个）；用户在场档（次级/弱）不在泵内，留在池里等用户 request/专项.
-   * @returns 本次泵出的案卷号列表.
-   */
-  private async pumpMainReview(): Promise<readonly string[]> {
-    const meetings = (await this.domain()).table('meetings')
-    const pool: { readonly docId: string; readonly priority: number }[] = []
-    for (const [, value] of meetings.entries()) {
-      if (value.review?.state === 'filed' && REVIEW_TIERS[value.type] === 'main') {
-        pool.push({ docId: value.docId, priority: value.review.priority ?? 99 })
-      }
-    }
-    pool.sort((a, b) => a.priority - b.priority)
-    const pumped: string[] = []
-    for (const entry of pool) {
-      if (await this.startReview(entry.docId)) pumped.push(entry.docId)
-    }
-    return pumped
-  }
-
-  /**
-   * 启动恢复（ADR-0011 Q1/Q3/Q9/Q10-C/Q11）：服务装配完成后延迟一拍执行一次。
-   * 三步闭环：①清理替身死会话（Q10-C，进程重启后必然无驱动者）；②重建全档位
-   * reviewing/accepted 档案（Q3/Q9：有审查意见→按意见推进，无→回滚 filed 重泵）；
-   * ③泵主力档 filed（含刚回滚出的）。
-   * 全池出审零成功时 loud 报错（Q11：配置错误显式暴露，临时故障仍走静默回滚）.
-   * @returns 泵出与重建详情（供启动日志）.
-   */
-  async recoverReviews(): Promise<{ readonly pumped: readonly string[]; readonly rebuilt: readonly string[]; readonly rolledBack: readonly string[] }> {
-    // Q10-C：清理替身死会话（审查/监督两路，均幂等）.
-    if (this.spawner?.disposeAllStandins !== undefined) await this.spawner.disposeAllStandins()
-    await this.supervisorSpawner?.disposeAllStandins?.()
-    const meetings = (await this.domain()).table('meetings')
-    const rebuilt: string[] = []
-    const rolledBack: string[] = []
-    for (const [, row] of meetings.entries()) {
-      const state = row.review?.state
-      if (state !== 'reviewing' && state !== 'accepted') continue
-      const records = await this.recordsOf(row.docId)
-      const reviewerOpinion = records.some(record =>
-        record.kind === 'review' && record.authorName === '审查主体')
-      if (reviewerOpinion) {
-        // 有审查意见而状态仍在 reviewing/accepted（进程崩溃掉在落板与推进之间）：按意见推进.
-        const dissenting = this.dissentingNames(row, records)
-        await this.advanceReview(row.docId, review => { review.state = dissenting.length > 0 ? 'hearing' : 'decidable' })
-        await this.recordReviewEvent(row.docId, '启动重建：检测到审查意见已落板而状态未推进，已按意见推进'
-          + `（${dissenting.length > 0 ? '沟通纠正（有异议方）' : '决议出口（无异议方）'}）`)
-        rebuilt.push(row.docId)
-      } else {
-        // 无审查意见：替身已死且未产出——回滚 filed 重新泵（Q3）.
-        await this.advanceReview(row.docId, review => { review.state = 'filed' })
-        await this.recordReviewEvent(row.docId, '启动重建：审查替身已死且未产出审查意见，回滚待审池重新出审')
-        rolledBack.push(row.docId)
-      }
-    }
-    const pumped = await this.pumpMainReview()
-    // Q11：池非空而无一出审成功 → loud（配置错误显式暴露）.
-    if (this.spawner !== undefined && pumped.length === 0 && rolledBack.length === 0) {
-      const pending = [...meetings.entries()].filter(([, value]) => value.review?.state === 'filed').length
-      if (pending > 0) {
-        this.ctx.logger.error(`[pandaclaw] 待审池全员出审失败（${pending} 件 filed 未动）：检查审查替身 preset（pc-reviewer）装配与底座 agents 服务`)
-      }
-    }
-    return { pumped, rebuilt, rolledBack }
-  }
-
-  /**
-   * 审查替身会话销毁兜底（ADR-0011 Q5-B）：spawn 成功后替身被 dispose（意外死亡/被杀）
-   * 而档案仍在 reviewing/accepted 且无审查意见 → 回滚 filed 自动重泵。
-   * 主动 dispose（交卷/restart 前状态已离开 reviewing/accepted）天然不触发.
-   * @param docId - 替身所属案卷号（由宿主解析 sessionId 前缀得出）.
-   */
-  async handleStandinDisposed(docId: string): Promise<void> {
-    const row = await this.meetingOrThrow(docId)
-    const state = row.review?.state
-    if (state !== 'reviewing' && state !== 'accepted') return
-    const records = await this.recordsOf(docId)
-    if (records.some(record => record.kind === 'review' && record.authorName === '审查主体')) return
-    await this.advanceReview(docId, review => { review.state = 'filed' })
-    await this.recordReviewEvent(docId, '审查替身会话意外销毁且未产出审查意见，回滚待审池自动重泵')
-    await this.pumpMainReview()
-  }
-
-  /**
-   * 复审重启逃生门（ADR-0011 Q5-C/Q6-A）：用户（主持人授意）废弃当前审查替身的工作，
-   * 立即重开审查——回滚 filed 后当场走完 startReview（不等泵）.
-   * 适用状态仅 reviewing/accepted（hearing 走 close-hearing、decidable 直接 adjudicate、
-   * feedback 直接 reply——各有其道）.
-   * @param docId - 文号.
-   */
-  async reviewRestart(docId: string): Promise<PcFact> {
-    const row = await this.meetingOrThrow(docId)
-    const state = row.review?.state ?? 'idle'
-    if (state !== 'reviewing' && state !== 'accepted') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${docId} 当前复审状态为 ${state}，不在审查阶段——只有替身未产出审查意见的档案可重启复审（reviewing/accepted）；`
-        + 'hearing 走 close-hearing 收窗、decidable 直接三选、feedback 直接回告')
-    }
-    // 废弃旧替身（Q10-A）：dispose 幂等；spawn 注册表无此档案时静默.
-    if (this.spawner !== undefined) await this.spawner.disposeReviewer(docId)
-    await this.advanceReview(docId, review => { review.state = 'filed' })
-    await this.recordReviewEvent(docId, '用户重启复审：废弃原审查替身工作，重新出审')
-    await this.startReview(docId, true)
-    const fresh = await this.meetingOrThrow(docId)
-    return { pc: 'meeting', meeting: toMeetingView(fresh) }
-  }
-
-  /**
- * 判定异议方名单（ADR-0010 Q12）：记录流里投过**反对票**的成员名集合.
- * 质询是 npc 审查方的流程内工作（R2 强制各提至少 1 个），不构成异议表达；
- * 异议方的现实语义＝明确反对决议的成员——只有反对票是机械可判的「提出异议」.
- */
-  private dissentingNames(row: MeetingRow, records: readonly RecordRow[]): readonly string[] {
-    return [...row.cppccNames, ...row.npcNames].filter(name => {
-      const byName = records.filter(record => record.authorName === name)
-      return byName.some(record => record.kind === 'vote' && record.stance === '反对')
-    })
-  }
-
-  /**
-   * 审查替身直写审查意见（ADR-0010 Q6/Q7：不经主持人代录）。
-   * 只装给 `pc-reviewer` preset 的替身会话；服务层校验 authorName 约定.
-   * @param actorSessionId - 审查替身会话 id（审计字段）.
-   * @param input - 文号、审查结论（维持/建议修订/建议解释/建议驳回）与逐条处置清单.
+   * 审查替身直写审查意见（实现见 ReviewService.reviewVerdict）.
    */
   async reviewVerdict(actorSessionId: string, input: { readonly docId: string; readonly verdict: string; readonly disposal: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
-    const state = this.reviewOf(row).state
-    if (state !== 'reviewing' && state !== 'accepted') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${input.docId} 当前复审状态为 ${state}，不在审查阶段（③ reviewing）——审查替身只在该阶段直写审查意见`)
-    }
-    if (input.verdict.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '审查意见为空')
-    if (input.verdict.length > REVIEW_OPINION_LIMIT) {
-      throw new PcError('WORD_LIMIT', `审查意见 ${input.verdict.length} 字超 ${REVIEW_OPINION_LIMIT} 上限：压缩后重提`)
-    }
-    const records = await this.recordsOf(input.docId)
-    const seq = this.nextSeq(records, record => record.kind === 'review' && record.authorName === '审查主体')
-    await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: 'review', stage: 'review', authorName: '审查主体', seq }),
-      docId: input.docId,
-      kind: 'review',
-      stage: 'review',
-      seat: 'chair',
-      authorName: '审查主体',
-      authorSessionId: actorSessionId,
-      text: `【审查意见】${input.verdict}\n【处置清单】${input.disposal}`,
-      at: Date.now(),
-    })
-    // 审查意见已落板：有异议方→进 hearing（被动陈述窗口）；无→直接 decidable（呈用户三选）.
-    const dissenting = this.dissentingNames(row, records)
-    const next: ReviewState = dissenting.length > 0 ? 'hearing' : 'decidable'
-    const view = await this.advanceReview(input.docId, review => { review.state = next })
-    // 交卷即销毁替身会话（ADR-0011 Q10-A：使命完成，主动 dispose 释放资源；
-    // 此时状态已离开 reviewing/accepted，5B 兜底条件不触发）.
-    if (this.spawner !== undefined) await this.spawner.disposeReviewer(input.docId)
-    if (next === 'decidable') {
-      // 无异议方：审查意见即呈报用户——由主持人按呈现动作推进（工具侧呈现），这里标记可裁.
-    }
-    return { pc: 'meeting', meeting: view }
+    return this.reviewService.reviewVerdict(actorSessionId, input)
   }
 
   /**
-   * 异议方公民被动陈述（ADR-0010 Q12/Q13）：复审已触发时，保留会话的异议方
-   * 以其原身份在 hearing 阶段陈述原异议论据；不主动开路、不参与裁量.
-   * @param actorSessionId - 异议方会话 id（审计字段）.
-   * @param input - 文号与陈述文本.
+   * 异议方公民被动陈述（实现见 ReviewService.reviewStatement）.
    */
   async reviewStatement(actorSessionId: string, input: { readonly docId: string; readonly name: string; readonly text: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
-    const state = this.reviewOf(row).state
-    if (state !== 'hearing') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${input.docId} 当前复审状态为 ${state}，不在沟通纠正阶段（④ hearing）——异议方陈述只在该窗口受理`)
-    }
-    const records = await this.recordsOf(input.docId)
-    const dissenting = this.dissentingNames(row, records)
-    if (!dissenting.includes(input.name)) {
-      throw new PcError('SEAT_FORBIDDEN', `「${input.name}」不在异议方名单（${dissenting.join('、') || '无'}）：只有原会议中提出过异议的成员可作被动陈述`)
-    }
-    if (input.text.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '陈述为空')
-    if (input.text.length > WORD_LIMITS.opinion) {
-      throw new PcError('WORD_LIMIT', `异议方陈述 ${input.text.length} 字超 ${WORD_LIMITS.opinion} 上限：压缩后重提`)
-    }
-    const already = records.some(record =>
-      record.kind === 'review' && record.authorName === input.name && record.stage === 'hearing')
-    if (already) throw new PcError('ALREADY_RECORDED', `「${input.name}」已作异议方陈述；如需补充请由主持人代录`)
-    const seq = this.nextSeq(records, record => record.kind === 'review' && record.stage === 'hearing')
-    await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: 'review', stage: 'hearing', authorName: input.name, seq }),
-      docId: input.docId,
-      kind: 'review',
-      stage: 'hearing',
-      seat: 'chair',
-      authorName: input.name,
-      authorSessionId: actorSessionId,
-      text: `【异议方陈述】${input.text}`,
-      at: Date.now(),
-    })
-    // 收窗判定：全部异议方已陈述 → 呈用户三选（decidable）.
-    const stated = new Set(records
-      .filter(record => record.kind === 'review' && record.stage === 'hearing')
-      .map(record => record.authorName))
-    const pending = dissenting.filter(name => !stated.has(name))
-    const next: ReviewState = pending.length > 0 ? 'hearing' : 'decidable'
-    const view = await this.advanceReview(input.docId, review => { review.state = next })
-    return { pc: 'meeting', meeting: view }
+    return this.reviewService.reviewStatement(actorSessionId, input)
   }
 
   /**
-   * 主持人（用户授意）结束听证窗口：异议方未能全部陈述时给收窗逃生门
-   * （宿主未唤醒异议方/异议方永久缺席）。程序性动作，不替代用户三选.
-   * @param docId - 文号.
+   * 结束听证窗口（实现见 ReviewService.reviewCloseHearing）.
    */
   async reviewCloseHearing(docId: string): Promise<PcFact> {
-    const row = await this.meetingOrThrow(docId)
-    const state = this.reviewOf(row).state
-    if (state !== 'hearing') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${docId} 不在沟通纠正阶段（${state}），无听证可收`)
-    }
-    const view = await this.advanceReview(docId, review => { review.state = 'decidable' })
-    return { pc: 'meeting', meeting: view }
+    return this.reviewService.reviewCloseHearing(docId)
   }
 
   /**
-   * 用户出口三选（ADR-0010 Q10/Q16）：修订重议／解释性决议／驳回并说明.
-   * 审查替身出建议性审查意见后呈用户；最终通过/修订永远由用户决定.
-   * @param actorSessionId - 用户/主持人会话 id（审计字段）.
-   * @param input - 文号与三选值.
+   * 用户出口三选（实现见 ReviewService.reviewAdjudicate）.
    */
   async reviewAdjudicate(actorSessionId: string, input: {
     readonly docId: string
@@ -730,165 +206,66 @@ export class PandaClawService extends Service {
     /** dismiss（驳回）时的逐条说明；revise/interpret 可为空. */
     readonly note?: string
   }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
-    const state = this.reviewOf(row).state
-    if (state !== 'decidable') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${input.docId} 当前复审状态为 ${state}，不在决议出口（⑤ decidable）——先有审查意见并呈报用户后方可三选`)
-    }
-    if (!['revise', 'interpret', 'dismiss'].includes(input.choice)) {
-      throw new PcError('REVIEW_CHOICE_INVALID', `出口三选只接受 revise（修订重议）/ interpret（解释性决议）/ dismiss（驳回并说明）；收到「${String(input.choice)}」`)
-    }
-    const records = await this.recordsOf(input.docId)
-    const dissenting = this.dissentingNames(row, records)
-    // 出口裁定落板（kind=review，authorName='用户'，标注三选）.
-    const seq = this.nextSeq(records, record => record.kind === 'review' && record.authorName === '用户' && record.stage === 'adjudicate')
-    await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: 'review', stage: 'adjudicate', authorName: '用户', seq }),
-      docId: input.docId,
-      kind: 'review',
-      stage: 'adjudicate',
-      seat: 'chair',
-      authorName: '用户',
-      authorSessionId: actorSessionId,
-      text: `【复审出口·${input.choice === 'revise' ? '修订重议' : input.choice === 'interpret' ? '解释性决议' : '驳回并说明'}】${
-        input.note !== undefined && input.note.trim().length > 0 ? `\n${input.note}` : ''
-      }${dissenting.length > 0 ? `\n【涉异议方】${dissenting.join('、')}` : ''}`,
-      at: Date.now(),
-    })
-    // 落地（Q16）：修订→新卷关联（revisedDocId 由后续 convene 填写，这里置 pending 标记）；
-    // 解释→原卷追加解释性 resolution 由主持人按 pc_record 落板（interpretRecordId 后续关联）；
-    // 驳回→直接进反馈回告.
-    const view = await this.advanceReview(input.docId, review => {
-      review.choice = input.choice
-      review.state = 'feedback'
-    })
-    return { pc: 'meeting', meeting: view }
+    return this.reviewService.reviewAdjudicate(actorSessionId, input)
   }
 
   /**
-   * 登记复审出口的落地关联（ADR-0010 Q16，ADR-0011 Q14/Q15）：
-   * 修订→新案卷号（对称谱系：新卷记 originDocId＋上轮审查结论摘要）；
-   * 解释→解释性 resolution 记录 id（同效力同义务：同卷复审状态机再开一轮）.
-   * 由主持人（用户授意）在 convene 新卷/落解释决议后调用，补全落地关联字段.
-   * @param docId - 被复审案卷号.
-   * @param input - 关联字段.
+   * 登记复审出口的落地关联（实现见 ReviewService.reviewLinkLanding）.
    */
   async reviewLinkLanding(docId: string, input: { readonly revisedDocId?: string; readonly interpretRecordId?: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(docId)
-    if ((input.revisedDocId === undefined) === (input.interpretRecordId === undefined)) {
-      throw new PcError('REVIEW_CHOICE_INVALID', '落地关联只能填其一：修订→revisedDocId；解释→interpretRecordId')
-    }
-    if (input.revisedDocId !== undefined) {
-      const revised = await this.meetingOrThrow(input.revisedDocId)
-      if (!revised.docId.startsWith('PC-')) throw new PcError('BAD_DOCUMENT_ID', '修订案卷号非法')
-    }
-    const view = await this.advanceReview(docId, review => {
-      if (input.revisedDocId !== undefined) review.revisedDocId = input.revisedDocId
-      if (input.interpretRecordId !== undefined) review.interpretRecordId = input.interpretRecordId
-    })
-    if (input.revisedDocId !== undefined) {
-      // Q14-A 修订谱系对称：新卷记「修订来源 originDocId＋上轮审查结论摘要」——
-      // 摘要取原卷记录流最新审查主体意见（截断），新卷出审时注入审查包核验焦点.
-      const records = await this.recordsOf(docId)
-      const sourceOpinion = [...records].reverse().find(record =>
-        record.kind === 'review' && record.authorName === '审查主体')
-      const sourceNote = sourceOpinion?.text !== undefined
-        ? sourceOpinion.text.slice(0, 400)
-        : ''
-      await this.advanceReview(input.revisedDocId, review => {
-        review.originDocId = docId
-        review.sourceReviewNote = sourceNote
-      })
-      await this.recordReviewEvent(docId, `复审出口·修订重议：决议关联新卷 ${input.revisedDocId}（谱系已对称入档）`)
-    } else if (input.interpretRecordId !== undefined) {
-      // Q15-A 解释性决议同效力同义务：解释落板即同卷复审状态机再开一轮
-      // （count 累计保留；主力档自动泵/弱档用户在场，出口仍用户三选）.
-      await this.advanceReview(docId, review => { review.state = 'filed' })
-      await this.recordReviewEvent(docId, `复审出口·解释性决议：解释落板（记录 ${input.interpretRecordId}），复审同卷再开一轮（同效力同义务）`)
-      await this.pumpMainReview()
-    }
-    const fresh = await this.meetingOrThrow(docId)
-    return { pc: 'meeting', meeting: toMeetingView(fresh) }
+    return this.reviewService.reviewLinkLanding(docId, input)
   }
 
   /**
-   * 逐条回告落板（ADR-0010 Q5-C/§113）：每条复审意见关联处置结论与回告文本.
-   * 回告齐备（≥ 已登记意见条数）后复审闭环（closed）.
-   * @param actorSessionId - 主持人会话 id（审计字段；回告由主持人按决议/审查意见撰写）.
-   * @param input - 文号与回告文本（可多条分批，按条累计）.
+   * 逐条回告落板（实现见 ReviewService.reviewReply）.
    */
   async reviewReply(actorSessionId: string, input: { readonly docId: string; readonly text: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
-    const current = this.reviewOf(row)
-    if (current.state !== 'feedback' && current.state !== 'decidable') {
-      throw new PcError('REVIEW_STAGE_BLOCKED', `案卷 ${input.docId} 当前复审状态为 ${current.state}，不在反馈回告阶段（⑥ feedback）——回告在出口裁定后落板`)
-    }
-    if (input.text.trim().length === 0) throw new PcError('STRUCTURE_FAIL', '回告文本为空')
-    if (input.text.length > MAX_TEXT_CHARS) {
-      throw new PcError('WORD_LIMIT', `回告文本 ${input.text.length} 字超硬上限 ${MAX_TEXT_CHARS}`)
-    }
-    const records = await this.recordsOf(input.docId)
-    const seq = this.nextSeq(records, record => record.kind === 'review-reply')
-    await this.putRecord({
-      id: buildRecordId({ docId: input.docId, kind: 'review-reply', stage: 'review', authorName: '主持人', seq }),
-      docId: input.docId,
-      kind: 'review-reply',
-      stage: 'review',
-      seat: 'chair',
-      authorName: '主持人',
-      authorSessionId: actorSessionId,
-      text: input.text,
-      at: Date.now(),
-    })
-    // 回告齐备判定：review-reply 条数 ≥ 已登记复审意见条数 → 闭环.
-    // seq 即本次回告落板后的累计条数（nextSeq 在 putRecord 前基于旧记录计算）.
-    const replies = seq
-    const target = current.count
-    const next: ReviewState = replies >= target ? 'closed' : 'feedback'
-    const view = await this.advanceReview(input.docId, review => { review.state = next })
-    return { pc: 'meeting', meeting: view }
+    return this.reviewService.reviewReply(actorSessionId, input)
   }
 
   /**
-   * 分级批量驳回（ADR-0010 Q5-A）：对审查意见为「建议维持/建议驳回」的 decidable
-   * 档案一键批量驳回（驳回=认可维持原决议，出口仍需用户决定但可批量确认）；
-   * 「建议修订/建议解释」的档案必须逐件三选（实质变更不批量化）.
-   * @param actorSessionId - 用户/主持人会话 id（审计字段）.
-   * @param docIds - 待批量驳回的案卷号列表（须均为 decidable 且审查意见可批量）.
-   * @param note - 统一的驳回说明模板（每条回告均携带；缺省用标准说明）.
-   * @returns 各案卷的处理结果（成功驳回或跳过原因）.
+   * 分级批量驳回（实现见 ReviewService.reviewBatchDismiss）.
    */
   async reviewBatchDismiss(actorSessionId: string, input: {
     readonly docIds: readonly string[]
     readonly note?: string
   }): Promise<ReadonlyArray<{ readonly docId: string; readonly state: ReviewState; readonly note?: string }>> {
-    if (input.docIds.length === 0) {
-      throw new PcError('REVIEW_STAGE_BLOCKED', '批量驳回必须指定至少一个案卷（docIds）')
-    }
-    const defaultNote = input.note ?? '批量复审处置：经审查维持原决议，未见需修订事项；逐条处置清单已随审查意见入档。'
-    const results: Array<{ readonly docId: string; readonly state: ReviewState; readonly note?: string }> = []
-    for (const docId of input.docIds) {
-      const row = await this.meetingOrThrow(docId)
-      const current = this.reviewOf(row)
-      if (current.state !== 'decidable') {
-        results.push({ docId, state: current.state, note: `非待裁状态（${current.state}），跳过` })
-        continue
-      }
-      const records = await this.recordsOf(docId)
-      const verdict = [...records].reverse().find(record =>
-        record.kind === 'review' && record.authorName === '审查主体')
-      const verdictText = verdict?.text ?? ''
-      // Q19-A 三分类收敛：仅「维持」可批量——含修订/解释/（旧数据）建议驳回的档案逐件三选
-      // （「建议驳回」旧数据按方向性语义＝建议撤销，批量维持会方向性出错，必须逐件）.
-      if (/建议修订|建议解释|建议驳回|修订重议|解释性/.test(verdictText)) {
-        results.push({ docId, state: current.state, note: '审查意见含修订/解释/驳回建议，须逐件三选（不批量化）' })
-        continue
-      }
-      // 可批量：驳回并说明（先落出口裁定，再进 feedback，由后续回告闭环）.
-      await this.reviewAdjudicate(actorSessionId, { docId, choice: 'dismiss', note: defaultNote })
-      results.push({ docId, state: 'feedback', note: defaultNote })
-    }
-    return results
+    return this.reviewService.reviewBatchDismiss(actorSessionId, input)
+  }
+
+  /**
+   * 复审重启逃生门（实现见 ReviewService.reviewRestart）.
+   */
+  async reviewRestart(docId: string): Promise<PcFact> {
+    return this.reviewService.reviewRestart(docId)
+  }
+
+  /**
+   * 启动恢复（实现见 ReviewService.recoverReviews；宿主装配完成后延迟一拍调用）.
+   */
+  async recoverReviews(): Promise<{ readonly pumped: readonly string[]; readonly rebuilt: readonly string[]; readonly rolledBack: readonly string[] }> {
+    return this.reviewService.recoverReviews()
+  }
+
+  /**
+   * 审查替身会话销毁兜底（实现见 ReviewService.handleStandinDisposed；宿主 5B 监听转发）.
+   */
+  async handleStandinDisposed(docId: string): Promise<void> {
+    return this.reviewService.handleStandinDisposed(docId)
+  }
+
+  /**
+   * 归档位点批量泵（Q8-A 单点反向依赖：实现见 ReviewService.pumpMainReview）.
+   */
+  async pumpMainReview(): Promise<readonly string[]> {
+    return this.reviewService.pumpMainReview()
+  }
+
+  /**
+   * 协议降级标记推导（Q8-A 单点反向依赖：实现见 ReviewService.reviewFlagOf）.
+   */
+  reviewFlagOf(records: readonly RecordRow[]): ReviewFlag {
+    return this.reviewService.reviewFlagOf(records)
   }
 
   // —— 主持人操作 ——
@@ -913,10 +290,10 @@ export class PandaClawService extends Service {
     if (cppccNames.some(name => npcNames.includes(name))) {
       throw new PcError('ROSTER_MISMATCH', '同一人名不得同时出现在 cppcc 与 npc 名单（协商方与审查方必须分离）')
     }
-    const meetings = (await this.domain()).table('meetings')
+    const meetings = await this.store.allMeetings()
     const year = new Date().getFullYear()
     let seq = 0
-    for (const [, existing] of meetings.entries()) {
+    for (const existing of meetings) {
       const parsedExisting = parseDocumentId(existing.docId)
       if (parsedExisting !== undefined && parsedExisting.type === request.type && parsedExisting.year === year) {
         seq = Math.max(seq, parsedExisting.seq)
@@ -938,7 +315,7 @@ export class PandaClawService extends Service {
         : { id: def.id, state: 'pending' }),
       createdAt: Date.now(),
     }
-    await meetings.put(docId, row)
+    await this.store.putMeeting(row)
     return { pc: 'meeting', meeting: toMeetingView(row) }
   }
 
@@ -948,8 +325,7 @@ export class PandaClawService extends Service {
    * @param action - `advance`=进入下一阶段（当前阶段置 done）；`round`=当前回路阶段开启新一轮（三审制计数）.
    */
   async stage(docId: string, action: 'advance' | 'round'): Promise<PcFact> {
-    const meetings = (await this.domain()).table('meetings')
-    const snapshot = await this.meetingOrThrow(docId)
+    const snapshot = await this.store.meeting(docId)
     if (action === 'advance') {
       // 三形态裁定门（ADR-0003）：离开裁定门阶段前必须已有 ruling 锚点.
       const currentIndex = snapshot.stages.findIndex(stage => stage.state === 'active')
@@ -957,7 +333,7 @@ export class PandaClawService extends Service {
         const currentDef = STAGE_FLOWS[snapshot.type][currentIndex]
         if ((RULING_GATED_STAGES[snapshot.type] ?? []).includes(currentDef.id)) {
           const gatedRound = snapshot.stages[currentIndex].round ?? 1
-          const hasRuling = (await this.recordsOf(docId)).some(record =>
+          const hasRuling = (await this.store.records(docId)).some(record =>
             record.kind === 'ruling' && record.stage === currentDef.id && record.round === gatedRound)
           if (!hasRuling) {
             throw new PcError('RULING_REQUIRED',
@@ -967,7 +343,7 @@ export class PandaClawService extends Service {
       }
     }
     let fact!: PcFact
-    await meetings.update(docId, row => {
+    await this.store.updateMeeting(docId, row => {
       this.assertOpen(row)
       const flow = STAGE_FLOWS[row.type]
       const currentIndex = row.stages.findIndex(stage => stage.state === 'active')
@@ -1012,7 +388,7 @@ export class PandaClawService extends Service {
     if (!CHAIR_KINDS.includes(input.kind)) {
       throw new PcError('SEAT_FORBIDDEN', `pc_record 只接受主持人锚点产物：${CHAIR_KINDS.join('/')}；成员产物请走各自通道`)
     }
-    const row = await this.meetingOrThrow(input.docId)
+    const row = await this.store.meeting(input.docId)
     this.assertOpen(row)
     const stageId = input.stage ?? row.stages.find(stage => stage.state === 'active')?.id
     if (stageId === undefined || row.stages.every(stage => stage.id !== stageId)) {
@@ -1021,11 +397,11 @@ export class PandaClawService extends Service {
     if (input.text.length > MAX_TEXT_CHARS) {
       throw new PcError('WORD_LIMIT', `登记文本 ${input.text.length} 字超硬上限 ${MAX_TEXT_CHARS}；请压缩为摘要`)
     }
-    const priorRecords = await this.recordsOf(input.docId)
-    const seq = this.nextSeq(priorRecords, record => record.kind === input.kind && record.stage === stageId && record.authorName === '主持人')
+    const priorRecords = await this.store.records(input.docId)
+    const seq = this.store.nextSeq(priorRecords, record => record.kind === input.kind && record.stage === stageId && record.authorName === '主持人')
     // 裁定等回路锚点必须带轮次戳，供阶段门禁按 stage+round 精确核验.
     const stageRound = row.stages.find(stage => stage.id === stageId)?.round
-    const record = await this.putRecord({
+    const record = await this.store.putRecord({
       id: buildRecordId({ docId: input.docId, kind: input.kind, stage: stageId, ...(stageRound !== undefined ? { round: stageRound } : {}), authorName: '主持人', seq }),
       docId: input.docId,
       kind: input.kind,
@@ -1049,7 +425,7 @@ export class PandaClawService extends Service {
    * @param input - 文号与监督意见.
    */
   async superviseStandin(actorSessionId: string, input: { readonly docId: string; readonly text: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
+    const row = await this.store.meeting(input.docId)
     this.assertOpen(row)
     const flow = STAGE_FLOWS[row.type]
     const activeIndex = row.stages.findIndex(stage => stage.state === 'active')
@@ -1064,14 +440,14 @@ export class PandaClawService extends Service {
       throw new PcError('WORD_LIMIT', `替身监督意见 ${input.text.length} 字超 ${WORD_LIMITS.opinion} 字上限：压缩后重提`)
     }
     const round = activeStage.round ?? 1
-    const priorRecords = await this.recordsOf(input.docId)
+    const priorRecords = await this.store.records(input.docId)
     const exists = priorRecords.some(record =>
       record.kind === 'supervision' && record.stage === activeStage.id && record.round === round && record.authorName === '用户替身')
     if (exists) {
       throw new PcError('ALREADY_RECORDED', `本轮（r${round}）用户替身已提交监督意见；如需补充请主持人代录或等下一轮`)
     }
-    const seq = this.nextSeq(priorRecords, record => record.kind === 'supervision' && record.stage === activeStage.id)
-    const record = await this.putRecord({
+    const seq = this.store.nextSeq(priorRecords, record => record.kind === 'supervision' && record.stage === activeStage.id)
+    const record = await this.store.putRecord({
       id: buildRecordId({ docId: input.docId, kind: 'supervision', stage: activeStage.id, round, authorName: '用户替身', seq }),
       docId: input.docId,
       kind: 'supervision',
@@ -1093,18 +469,18 @@ export class PandaClawService extends Service {
    * @param input - 文号与要重绑的成员名.
    */
   async rebind(actorSessionId: string, input: { readonly docId: string; readonly name: string }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
+    const row = await this.store.meeting(input.docId)
     this.assertOpen(row)
     const isCppcc = row.cppccNames.includes(input.name)
     if (!isCppcc && !row.npcNames.includes(input.name)) {
       throw new PcError('SEAT_FORBIDDEN', `「${input.name}」不在本场会议名册内：重绑只针对在册席位`)
     }
-    const priorRecords = await this.recordsOf(input.docId)
+    const priorRecords = await this.store.records(input.docId)
     const stageId = row.stages.find(stage => stage.state === 'active')?.id ?? row.stages[0].id
     const relevant = priorRecords.filter(record => record.authorName === input.name)
     const previous = [...relevant].reverse().find(record => record.kind === 'rebind') ?? relevant[0]
-    const seq = this.nextSeq(priorRecords, record => record.kind === 'rebind' && record.authorName === input.name)
-    const record = await this.putRecord({
+    const seq = this.store.nextSeq(priorRecords, record => record.kind === 'rebind' && record.authorName === input.name)
+    const record = await this.store.putRecord({
       id: buildRecordId({ docId: input.docId, kind: 'rebind', stage: stageId, authorName: input.name, seq }),
       docId: input.docId,
       kind: 'rebind',
@@ -1133,7 +509,7 @@ export class PandaClawService extends Service {
     readonly kind: 'opinion' | 'inquiry' | 'reply'
     readonly text: string
   }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
+    const row = await this.store.meeting(input.docId)
     this.assertOpen(row)
     const flow = STAGE_FLOWS[row.type]
     const activeIndex = row.stages.findIndex(stage => stage.state === 'active')
@@ -1143,7 +519,7 @@ export class PandaClawService extends Service {
     }
     const seat = MEMBER_KIND_SEATS[input.kind]
     if (seat === undefined) throw new PcError('SEAT_FORBIDDEN', `pc_submit 不接受 ${input.kind}`)
-    const priorRecords = await this.recordsOf(input.docId)
+    const priorRecords = await this.store.records(input.docId)
     this.bindSeat(row, seat, input.name, actorSessionId, priorRecords)
     const limit = input.kind === 'opinion' ? WORD_LIMITS.opinion : input.kind === 'inquiry' ? WORD_LIMITS.inquiry : WORD_LIMITS.reply
     if (input.text.length > limit) {
@@ -1167,8 +543,8 @@ export class PandaClawService extends Service {
       }
       verdict = 'admitted'
     }
-    const seq = this.nextSeq(priorRecords, record => record.kind === input.kind && record.stage === activeStage.id && record.authorName === input.name)
-    const record = await this.putRecord({
+    const seq = this.store.nextSeq(priorRecords, record => record.kind === input.kind && record.stage === activeStage.id && record.authorName === input.name)
+    const record = await this.store.putRecord({
       id: buildRecordId({ docId: input.docId, kind: input.kind, stage: activeStage.id, round, authorName: input.name, seq }),
       docId: input.docId,
       kind: input.kind,
@@ -1196,13 +572,13 @@ export class PandaClawService extends Service {
     readonly stance: '赞成' | '反对' | '弃权'
     readonly reason: string
   }): Promise<PcFact> {
-    const row = await this.meetingOrThrow(input.docId)
+    const row = await this.store.meeting(input.docId)
     this.assertOpen(row)
     const activeStage = row.stages.find(stage => stage.state === 'active')
     if (activeStage === undefined || !VOTE_STAGES[row.type].includes(activeStage.id)) {
       throw new PcError('VOTE_STAGE_ONLY', `会议 ${input.docId} 当前阶段不可付表决（表决只发生在：${VOTE_STAGES[row.type].join('/')}）`)
     }
-    const priorRecords = await this.recordsOf(input.docId)
+    const priorRecords = await this.store.records(input.docId)
     this.bindSeat(row, 'npc', input.name, actorSessionId, priorRecords)
     // 立场集按会议类型切换：MIN=确证书两态，其余=选票三态（ADR-0002）.
     const allowedStances = stancesFor(row.type)
@@ -1237,7 +613,7 @@ export class PandaClawService extends Service {
       record.kind === 'vote' && record.stage === activeStage.id && record.round === round && record.authorName === input.name)) {
       throw new PcError('DUPLICATE_VOTE', `「${input.name}」本轮（r${round}）已提交过确证书；如需改口请待主持人重新发起确证`)
     }
-    const record = await this.putRecord({
+    const record = await this.store.putRecord({
       id: buildRecordId({ docId: input.docId, kind: 'vote', stage: activeStage.id, round, authorName: input.name, seq: 1 }),
       docId: input.docId,
       kind: 'vote',
@@ -1258,16 +634,14 @@ export class PandaClawService extends Service {
    * @param docId - 文号.
    */
   async tally(docId: string): Promise<PcFact> {
-    const row = await this.meetingOrThrow(docId)
+    const row = await this.store.meeting(docId)
     this.assertOpen(row)
     const activeStage = row.stages.find(stage => stage.state === 'active')
     if (activeStage === undefined || !VOTE_STAGES[row.type].includes(activeStage.id)) {
       throw new PcError('VOTE_STAGE_ONLY', `当前阶段不在表决环节（可表决阶段：${VOTE_STAGES[row.type].join('/')}）`)
     }
-    const tallies = (await this.domain()).table('tallies')
     const round = activeStage.round ?? 1
-    const key = tallyKey(docId, activeStage.id, round)
-    if (tallies.get(key) !== undefined) {
+    if ((await this.store.tallies(docId)).some(tally => tally.stage === activeStage.id && tally.round === round)) {
       throw new PcError('ALREADY_RECORDED', `本轮（${activeStage.id} r${round}）已完成计票：未通过时请提炼反对焦点（pc_record focus）后用 pc_stage round 开新一轮`)
     }
     // 监督窗口双门（ADR-0008/0009）：仅在计票阶段 ⭐（征意回路）时生效；
@@ -1275,7 +649,7 @@ export class PandaClawService extends Service {
     // 轻量确证通道）；LEG 公布批准非 ⭐ 亦不在其列.
     const votingStageDef = STAGE_FLOWS[row.type].find(def => def.id === activeStage.id)
     if (votingStageDef !== undefined && votingStageDef.deliberative && row.type !== 'MIN') {
-      const records = await this.recordsOf(docId)
+      const records = await this.store.records(docId)
       // 门一：关窗预告——拟计票前须先有 warning 记录，关窗由瞬时事件变为可预示事件.
       const hasWarning = records.some(record =>
         record.kind === 'warning' && record.stage === activeStage.id && record.round === round)
@@ -1291,20 +665,20 @@ export class PandaClawService extends Service {
         // 服务层当场自动派发监督替身（seed 空、setup 硬编码，不经 AI），替身异步
         // 直写意见后再次计票放行；本人正常回应时永不抢答。await 真串行；
         // spawn 失败静默＋系统事件留痕（门二继续受阻，重试＝用户代录或再次计票）.
-        if (this.supervisorSpawner !== undefined) {
+        if (this.host !== undefined) {
           try {
-            await this.supervisorSpawner.spawnSupervisor(docId, activeStage.id, round)
+            await this.host.createStandin('supervisor', docId, { preset: SUPERVISOR_STANDIN_PRESET })
           } catch (error) {
-            await this.recordReviewEvent(docId, `监督替身派发失败（门二受阻时）：${String(error instanceof Error ? error.message : error)}——请代录用户监督意见或明示放弃后重试计票`)
+            await this.store.recordReviewEvent(docId, `监督替身派发失败（门二受阻时）：${String(error instanceof Error ? error.message : error)}——请代录用户监督意见或明示放弃后重试计票`)
           }
         }
         throw new PcError('SUPERVISION_PENDING',
           `用户监督窗口未收束（r${round}）：用户在场→代录其监督意见或明示放弃（pc_record kind=supervision）；`
           + '用户缺席→监督替身已自动派发（ADR-0010），待其以 pc_supervise 提交意见后重试计票'
-          + (this.supervisorSpawner === undefined ? '（当前环境未装配替身派发，请代录用户意见或明示放弃）' : ''))
+          + (this.host === undefined ? '（当前环境未装配替身派发，请代录用户意见或明示放弃）' : ''))
       }
     }
-    const votes = (await this.recordsOf(docId))
+    const votes = (await this.store.records(docId))
       .filter(record => record.kind === 'vote' && record.stage === activeStage.id && record.round === round)
     if (votes.length === 0) throw new PcError('TALLY_EMPTY', '本轮尚无任何选票：先由 npc 成员逐一点名投票')
     const result = mechanicalTally(
@@ -1330,7 +704,7 @@ export class PandaClawService extends Service {
       rule: result.rule,
       at: Date.now(),
     }
-    await tallies.put(key, tallyRow)
+    await this.store.putTally(tallyRow)
     // 征询模式（mode==='consultive'）：该轮不构成表决（ADR-0004）；出口＝主持人呈报用户三选裁定，引擎不加门禁.
     return { pc: 'tally', tally: toTallyView(tallyRow) }
   }
@@ -1342,10 +716,10 @@ export class PandaClawService extends Service {
    * @param options - terminate=true 为搁置终止（附原因）.
    */
   async adjourn(docId: string, options: { readonly terminate?: boolean; readonly reason?: string } = {}): Promise<PcFact> {
-    const row = await this.meetingOrThrow(docId)
+    const row = await this.store.meeting(docId)
     this.assertOpen(row)
     // 归档前取一次记录：非终止需要 resolution 锚点校验；入池的降级标记也要读决议文本.
-    const records = options.terminate === true ? [] : await this.recordsOf(docId)
+    const records = options.terminate === true ? [] : await this.store.records(docId)
     if (options.terminate !== true && !records.some(record => record.kind === 'resolution')) {
       throw new PcError('ADJOURN_BLOCKED', '红线8：未见任何 resolution 锚点记录——先用 pc_record 登记决议/纪要成文，再归档')
     }
@@ -1353,15 +727,14 @@ export class PandaClawService extends Service {
     // 「决定必经表决」红线引擎化，无 tally 的决议归档被拦（程序合法性归门禁，实体正确性归复审）.
     if (options.terminate !== true) {
       const voteStage = VOTE_STAGES[row.type][0]
-      const tallies = await (async () => [...(await this.domain()).table('tallies').entries()]
-        .map(([, value]) => value).filter(entry => entry.docId === docId && entry.stage === voteStage))()
-      if (tallies.length === 0) {
+      const stageTallies = (await this.store.tallies(docId))
+        .filter(entry => entry.stage === voteStage)
+      if (stageTallies.length === 0) {
         throw new PcError('ADJOURN_BLOCKED', `红线（决定必经表决）：本档表决阶段「${voteStage}」未见任何计票记录（tally）——先以 pc_tally 计票（含征询模式降级计票），再归档`)
       }
     }
-    const meetings = (await this.domain()).table('meetings')
     let fact!: PcFact
-    await meetings.update(docId, current => {
+    await this.store.updateMeeting(docId, current => {
       this.assertOpen(current)
       if (options.terminate === true) {
         current.status = 'terminated'
@@ -1382,7 +755,7 @@ export class PandaClawService extends Service {
       // 有备必审入池（ADR-0010 Q3/Q4）：主力档（RES/LEG）归档即自动进入复审待审池——
       // 状态置 filed，由归档位点的批量泵按优先级逐个出审；降级标记唯一=征询采信（Q4）.
       if (REVIEW_TIERS[current.type] === 'main' && current.review === undefined) {
-        const flag = this.reviewFlagOf(records)
+        const flag = this.reviewService.reviewFlagOf(records)
         current.review = {
           state: 'filed',
           flag,
@@ -1395,8 +768,8 @@ export class PandaClawService extends Service {
     })
     // 归档位点批量泵（Q3-B）：把池中全部主力档 filed 按 priority 排序逐个 spawn 审查替身
     // （含刚归档的这篇）；泵只处理主力档，用户在场档（次级/弱）留在池里等用户.
-    if (REVIEW_TIERS[(await this.meetingOrThrow(docId)).type] === 'main') {
-      await this.pumpMainReview()
+    if (REVIEW_TIERS[(await this.store.meeting(docId)).type] === 'main') {
+      await this.reviewService.pumpMainReview()
     }
     return fact
   }
@@ -1410,10 +783,10 @@ export class PandaClawService extends Service {
     readonly records: readonly PcRecordView[]
     readonly tallies: readonly PcTallyView[]
   }> {
-    const row = await this.meetingOrThrow(docId)
+    const row = await this.store.meeting(docId)
     const [records, tallies] = await Promise.all([
-      this.recordsOf(docId),
-      (async () => [...(await this.domain()).table('tallies').entries()].map(([, value]) => value).filter(entry => entry.docId === docId))(),
+      this.store.records(docId),
+      this.store.tallies(docId),
     ])
     return {
       meeting: toMeetingView(row),
@@ -1421,71 +794,6 @@ export class PandaClawService extends Service {
       tallies: tallies.map(toTallyView),
     }
   }
-}
-
-// —— 视图映射 ——
-
-function toMeetingView(row: MeetingRow): PcMeetingView {
-  const flow = STAGE_FLOWS[row.type]
-  const members: PcMemberView[] = [
-    ...row.cppccNames.map(name => ({ name, seat: 'cppcc' as const })),
-    ...row.npcNames.map(name => ({ name, seat: 'npc' as const })),
-  ]
-  const activeStage = row.stages.find(stage => stage.state === 'active')
-  const review = row.review
-  return {
-    docId: row.docId,
-    type: row.type,
-    tier: row.tier,
-    validation: row.validation,
-    topic: row.topic,
-    status: row.status,
-    members,
-    stages: row.stages.map((stage, index) => ({
-      id: stage.id,
-      label: flow[index].label,
-      deliberative: flow[index].deliberative,
-      state: stage.state,
-      ...(stage.round !== undefined ? { round: stage.round } : {}),
-    })),
-    ...(activeStage !== undefined ? { currentStage: activeStage.id } : {}),
-    ...(review !== undefined ? { review: {
-      state: review.state,
-      flag: review.flag,
-      count: review.count,
-      ...(review.choice !== undefined ? { choice: review.choice as 'revise' | 'interpret' | 'dismiss' } : {}),
-      ...(review.revisedDocId !== undefined ? { revisedDocId: review.revisedDocId } : {}),
-      ...(review.interpretRecordId !== undefined ? { interpretRecordId: review.interpretRecordId } : {}),
-      ...(review.originDocId !== undefined ? { originDocId: review.originDocId } : {}),
-      ...(review.sourceReviewNote !== undefined ? { sourceReviewNote: review.sourceReviewNote } : {}),
-      ...(review.priority !== undefined ? { priority: review.priority } : {}),
-    } } : {}),
-    createdAt: row.createdAt,
-    ...(row.closedAt !== undefined ? { closedAt: row.closedAt } : {}),
-  }
-}
-
-function toRecordView(row: RecordRow): PcRecordView {
-  return {
-    id: row.id,
-    docId: row.docId,
-    kind: row.kind,
-    stage: row.stage,
-    ...(row.round !== undefined ? { round: row.round } : {}),
-    seat: row.seat,
-    authorName: row.authorName,
-    authorSessionId: row.authorSessionId,
-    preview: row.text.length > 180 ? row.text.slice(0, 180) + '…' : row.text,
-    wordCount: row.text.length,
-    ...(row.stance !== undefined ? { stance: row.stance } : {}),
-    ...(row.verdict !== undefined ? { verdict: row.verdict } : {}),
-    ...(row.reason !== undefined ? { reason: row.reason } : {}),
-    at: row.at,
-  }
-}
-
-function toTallyView(row: TallyRow): PcTallyView {
-  return { ...row }
 }
 
 function kindLabel(kind: 'opinion' | 'inquiry' | 'reply'): string {
