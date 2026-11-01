@@ -213,7 +213,10 @@ export function makeAgentHost(ctx: Context, options: { readonly onStartup?: () =
     }
   }
 
-  const createdDisposer = ctx.on('agent/created', (payload: { readonly agent: Agent }) => { equipAgent(payload.agent) })
+  const createdDisposer = ctx.on('agent/created', (payload: { readonly agent: Agent }) => {
+    equipAgent(payload.agent)
+    return undefined
+  })
   // 5B dispose 兜底（ADR-0011 Q5-B）：审查替身会话意外销毁（非主动 dispose）时
   // 清簿记并通知服务层回滚重泵；主动 dispose（交卷/restart）时档案状态已离开
   // reviewing/accepted，服务层条件天然不触发。监督替身只清簿记（门二可重试）.
