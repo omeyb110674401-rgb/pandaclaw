@@ -31,3 +31,4 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
       - run: npm publish --registry=https://registry.npmjs.org --access public
+        working-directory: packages/meeting
