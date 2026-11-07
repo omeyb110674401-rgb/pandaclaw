@@ -5,13 +5,14 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
 import { sourceSkills } from './context.ts'
+import { MAIN_WINDOW } from '../sources/main-window.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
-import { UserError, type EngineForPeople, type Ticket } from '../core/index.ts'
+import { key, UserError, type Engine, type EngineForPeople, type Ticket, type Trigger } from '../core/index.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import type { DshExecutor } from '../executor/dsh.ts'
 import type { Health } from '../sources/host.ts'
@@ -36,7 +37,8 @@ export interface HttpHost {
   readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
-  readonly engine: EngineForPeople
+  /** `receive` lets the operator's own Session dispatch a task through the same intake every Source uses. */
+  readonly engine: EngineForPeople & Pick<Engine, 'receive'>
   readonly executor: Pick<DshExecutor, 'activeCount'>
   readonly health: Record<string, Health>
   readonly machine: Machine
@@ -203,6 +205,29 @@ function routes(runtime: HttpHost): Routes {
     'GET policy/history': () => policyHistory(store, runtime.sources, policyVersion(store.settings())),
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
+    // The operator's own Session hands work in here: the Trigger enters the same intake a Source uses, so Eval, Mandate,
+    // Ticket and Execution are unchanged. The Thread is fixed (`main-window:main`) because the operator has one conversation.
+    'POST dispatch': async ({ body }) => {
+      const { text, title } = z.object({
+        text: z.string().trim().min(1).max(20_000),
+        title: z.string().trim().max(200).optional(),
+      }).parse(await body())
+      const at = new Date().toISOString()
+      const trigger: Trigger = {
+        id: key(MAIN_WINDOW, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`),
+        source: MAIN_WINDOW,
+        threads: [{ source: MAIN_WINDOW, id: 'main' }],
+        actor: { source: MAIN_WINDOW, id: 'operator' },
+        human: true,
+        addressed: 'direct',
+        at,
+        text,
+        meta: title ? { title } : {},
+      }
+      const result = runtime.engine.receive(trigger)
+      runtime.requestPass()
+      return { trigger: trigger.id, result }
+    },
     'GET models': () => runtime.models(),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {

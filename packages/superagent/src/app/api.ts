@@ -39,6 +39,8 @@ export interface Api {
   'GET policy/history': { response: HistoryView }
   'POST policy-sync/:id': { response: { policy: unknown } }
   'POST setup/check': { response: { restarting: true } }
+  /** A task the operator dispatches from their own Session; it enters the Engine as a Trigger of the `main-window` Source. */
+  'POST dispatch': { body: { text: string; title?: string }; response: { trigger: string; result: string } }
   'GET models': { response: ModelCatalog }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
