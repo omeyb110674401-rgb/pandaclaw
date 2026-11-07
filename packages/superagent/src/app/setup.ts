@@ -76,7 +76,12 @@ export class Setup {
   private async resolve(settings: Settings): Promise<Deployment> {
     const { context, machine, lifetime } = this.host
     const probe = this.probe()
-    const deployment = await resolveDeployment(machine, settings.sources.github?.config, probe)
+    // A profile that loads no GitHub Source, such as one driven only by the `main-window` Source, has no repository and
+    // no agent account to verify. It resolves with a placeholder whose unusable `gh` fails only where GitHub is used.
+    const github = settings.sources.github?.config
+    const deployment = github === undefined
+      ? { ...machine, repository: '', github: { cli: 'gh-unavailable', login: '', noreply: '' } }
+      : await resolveDeployment(machine, github, probe)
     const feishu = await resolveFeishuBot(machine, settings.sources.feishu?.config, probe).catch((error: unknown) => {
       if (!(error instanceof SetupError)) throw error
       this.feishuProblem = error.problem
