@@ -23,5 +23,6 @@ To diff against upstream:
 2. `src/policy.ts`：Executor `directory` 的绝对路径校验同样接受 Windows 盘符路径，空值仍表示 `<stateDir>/work`。
 3. `src/app/setup.ts`：未配置 GitHub Source 时不再调用 `resolveDeployment`，改用占位部署（空 repository、`gh-unavailable` 身份）继续启动；只有真正使用 GitHub 的路径才会失败。不加载 GitHub Source、仅由 `main-window` Source 驱动的部署属于这种情况。
 4. `src/app/sessions.ts`：master Session 的工具白名单按平台过滤 `bash`/`pwsh`，只保留 profile 实际注册的那个 shell；`restrict()` 不再因为另一平台的内置工具不存在而拒绝整个白名单。
+5. `src/infra/environment.ts`：Windows 上不生成 worker shim。上游写入的 `gh`/`lark-cli` shim 是无扩展名的 `#!/bin/sh` 脚本，Windows 无法直接执行：它出现在 PATH 上时，系统会弹出「选择打开方式」对话框并让 worker 一直卡住。因此 Windows 跳过 shim 生成，`gh` 等命令改走 PATH 上的真实程序；副作用是 `blockedCommands` 在 Windows 上不再由 shim 拦截。
 
 这些改动只涉及路径校验、部署来源和工具装配，不改变上游的 ticket、审批与执行语义。
