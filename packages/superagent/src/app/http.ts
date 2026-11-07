@@ -213,10 +213,13 @@ function routes(runtime: HttpHost): Routes {
         title: z.string().trim().max(200).optional(),
       }).parse(await body())
       const at = new Date().toISOString()
+      const id = key(MAIN_WINDOW, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`)
       const trigger: Trigger = {
-        id: key(MAIN_WINDOW, `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`),
+        id,
         source: MAIN_WINDOW,
-        threads: [{ source: MAIN_WINDOW, id: 'main' }],
+        // One Thread per dispatched task: a Thread's later messages resume its ended tickets, which is right for a
+        // conversation and wrong for a queue of independent jobs.
+        threads: [{ source: MAIN_WINDOW, id }],
         actor: { source: MAIN_WINDOW, id: 'operator' },
         human: true,
         addressed: 'direct',

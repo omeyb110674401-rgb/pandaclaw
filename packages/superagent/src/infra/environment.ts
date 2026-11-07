@@ -97,10 +97,15 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
-  for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+  // Windows has no `sh` to run these scripts, and an extensionless script on PATH makes Windows ask which application
+  // opens it — which blocks the worker on a modal dialog. There the real CLIs are reached through the profile's PATH
+  // instead, so nothing is shimmed and `blockedCommands` is not enforced.
+  if (process.platform !== 'win32') {
+    await shim('gh', run(github.cli))
+    await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+    for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
+      await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+    }
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [

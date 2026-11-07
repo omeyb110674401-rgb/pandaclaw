@@ -260,10 +260,11 @@ export class Sessions {
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
-      // `bash` exists on POSIX and `pwsh` on Windows, and `restrict()` rejects a name the profile has no tool for, so keep
-      // only the shell the profile actually registered (the worker path filters the same way through WORK_TOOLS).
+      // `bash` exists on POSIX and `pwsh` on Windows, and `restrict()` rejects a name the profile has no tool for. Read
+      // inherited tools through the parent scope, as workOnly does: the global view misses preset tools.
+      const parent = scopeParentOf(agent)
       const shellTools = ['skill', 'bash', 'pwsh', 'read', 'read_image', 'job_output', 'job_list', 'job_kill']
-        .filter(name => agent.ctx.tools.get(name))
+        .filter(name => agent.ctx.tools.get(name, parent))
       binding.disposers.push(agent.ctx.tools.restrict({ allow: shellTools }),
         agent.ctx.tools.guard(execution => noWait(execution, () => this.routed(agent))))
     } else {
